@@ -1,0 +1,1692 @@
+// DATABASE SCHEMA (MySQL)
+
+-- Create database
+CREATE DATABASE IF NOT EXISTS finance_tracker;
+USE finance_tracker;
+
+-- Users table
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- Categories table
+CREATE TABLE categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    name VARCHAR(50) NOT NULL,
+    type ENUM('income', 'expense') NOT NULL,
+    color VARCHAR(20) DEFAULT '#607D8B',
+    icon VARCHAR(50) DEFAULT 'monetization_on',
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE KEY user_category (user_id, name, type)
+);
+
+-- Transactions table
+CREATE TABLE transactions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    category_id INT NOT NULL,
+    amount DECIMAL(10, 2) NOT NULL,
+    description VARCHAR(255),
+    transaction_date DATE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE RESTRICT
+);
+
+-- Budgets table
+CREATE TABLE budgets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    category_id INT NOT NULL,
+    amount DECIMAL(10, 2) NOT NULL,
+    period ENUM('daily', 'weekly', 'monthly', 'yearly') DEFAULT 'monthly',
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE,
+    UNIQUE KEY user_category_period (user_id, category_id, period, start_date)
+);
+
+-- Insert default categories
+INSERT INTO categories (user_id, name, type, color, icon) VALUES 
+(1, 'Salary', 'income', '#4CAF50', 'payments'),
+(1, 'Investments', 'income', '#2196F3', 'trending_up'),
+(1, 'Gifts', 'income', '#9C27B0', 'card_giftcard'),
+(1, 'Other Income', 'income', '#607D8B', 'monetization_on'),
+(1, 'Groceries', 'expense', '#FF9800', 'shopping_cart'),
+(1, 'Dining', 'expense', '#F44336', 'restaurant'),
+(1, 'Transportation', 'expense', '#3F51B5', 'commute'),
+(1, 'Entertainment', 'expense', '#E91E63', 'movie'),
+(1, 'Utilities', 'expense', '#009688', 'power'),
+(1, 'Housing', 'expense', '#795548', 'home'),
+(1, 'Healthcare', 'expense', '#F06292', 'local_hospital'),
+(1, 'Shopping', 'expense', '#8BC34A', 'shopping_bag'),
+(1, 'Travel', 'expense', '#FFC107', 'flight'),
+(1, 'Education', 'expense', '#9E9E9E', 'school'),
+(1, 'Miscellaneous', 'expense', '#607D8B', 'more_horiz');
+
+
+// BACKEND IMPLEMENTATION (Node.js with Express)
+
+// app.js - Main server file
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const csv = require('fast-csv');
+const fs = require('fs');
+const path = require('path');
+const dotenv = require('dotenv');
+const { Parser } = require('json2csv');
+
+// Load environment variables
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Database connection pool
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'finance_tracker',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// File upload configuration
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const uploadDir = path.join(__dirname, 'uploads');
+        if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir);
+        }
+        cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+        cb(null, `${Date.now()}-${file.originalname}`);
+    }
+});
+
+const upload = multer({ 
+    storage,
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'text/csv') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only CSV files are allowed'), false);
+        }
+    }
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Access denied' });
+    
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+};
+
+// User Routes
+
+// Register new user
+app.post('/api/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        
+        // Validate input
+        if (!username || !email || !password) {
+            return res.status(400).json({ error: 'All fields are required' });
+        }
+        
+        // Hash password
+        const saltRounds = 10;
+        const hashedPassword = await bcrypt.hash(password, saltRounds);
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Check if user already exists
+            const [existingUsers] = await connection.query(
+                'SELECT * FROM users WHERE username = ? OR email = ?',
+                [username, email]
+            );
+            
+            if (existingUsers.length > 0) {
+                return res.status(409).json({ error: 'Username or email already exists' });
+            }
+            
+            // Insert new user
+            const [result] = await connection.query(
+                'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+                [username, email, hashedPassword]
+            );
+            
+            const userId = result.insertId;
+            
+            // Create default categories for new user
+            await connection.query(`
+                INSERT INTO categories (user_id, name, type, color, icon)
+                SELECT ?, name, type, color, icon FROM categories WHERE user_id = 1
+            `, [userId]);
+            
+            res.status(201).json({ 
+                message: 'User registered successfully',
+                userId
+            });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        // Validate input
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Find user
+            const [users] = await connection.query(
+                'SELECT * FROM users WHERE email = ?',
+                [email]
+            );
+            
+            if (users.length === 0) {
+                return res.status(401).json({ error: 'Invalid credentials' });
+            }
+            
+            const user = users[0];
+            
+            // Compare password
+            const validPassword = await bcrypt.compare(password, user.password_hash);
+            if (!validPassword) {
+                return res.status(401).json({ error: 'Invalid credentials' });
+            }
+            
+            // Generate token
+            const token = jwt.sign(
+                { id: user.id, username: user.username },
+                process.env.JWT_SECRET,
+                { expiresIn: '24h' }
+            );
+            
+            res.status(200).json({
+                message: 'Login successful',
+                token,
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email
+                }
+            });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Categories Routes
+
+// Get all categories for user
+app.get('/api/categories', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            const [categories] = await connection.query(
+                'SELECT * FROM categories WHERE user_id = ? ORDER BY type, name',
+                [userId]
+            );
+            
+            res.status(200).json(categories);
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Get categories error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Create new category
+app.post('/api/categories', authenticateToken, async (req, res) => {
+    try {
+        const { name, type, color, icon } = req.body;
+        const userId = req.user.id;
+        
+        // Validate input
+        if (!name || !type) {
+            return res.status(400).json({ error: 'Name and type are required' });
+        }
+        
+        if (type !== 'income' && type !== 'expense') {
+            return res.status(400).json({ error: 'Type must be income or expense' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Check if category already exists
+            const [existingCategories] = await connection.query(
+                'SELECT * FROM categories WHERE user_id = ? AND name = ? AND type = ?',
+                [userId, name, type]
+            );
+            
+            if (existingCategories.length > 0) {
+                return res.status(409).json({ error: 'Category already exists' });
+            }
+            
+            // Insert new category
+            const [result] = await connection.query(
+                'INSERT INTO categories (user_id, name, type, color, icon) VALUES (?, ?, ?, ?, ?)',
+                [userId, name, type, color || '#607D8B', icon || 'monetization_on']
+            );
+            
+            const newCategory = {
+                id: result.insertId,
+                user_id: userId,
+                name,
+                type,
+                color: color || '#607D8B',
+                icon: icon || 'monetization_on'
+            };
+            
+            res.status(201).json(newCategory);
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Create category error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update category
+app.put('/api/categories/:id', authenticateToken, async (req, res) => {
+    try {
+        const categoryId = req.params.id;
+        const { name, color, icon } = req.body;
+        const userId = req.user.id;
+        
+        // Validate input
+        if (!name) {
+            return res.status(400).json({ error: 'Name is required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Check if category exists and belongs to user
+            const [categories] = await connection.query(
+                'SELECT * FROM categories WHERE id = ? AND user_id = ?',
+                [categoryId, userId]
+            );
+            
+            if (categories.length === 0) {
+                return res.status(404).json({ error: 'Category not found' });
+            }
+            
+            // Update category
+            await connection.query(
+                'UPDATE categories SET name = ?, color = ?, icon = ? WHERE id = ?',
+                [name, color || categories[0].color, icon || categories[0].icon, categoryId]
+            );
+            
+            res.status(200).json({
+                id: parseInt(categoryId),
+                user_id: userId,
+                name,
+                type: categories[0].type,
+                color: color || categories[0].color,
+                icon: icon || categories[0].icon
+            });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Update category error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete category
+app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
+    try {
+        const categoryId = req.params.id;
+        const userId = req.user.id;
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Check if category exists and belongs to user
+            const [categories] = await connection.query(
+                'SELECT * FROM categories WHERE id = ? AND user_id = ?',
+                [categoryId, userId]
+            );
+            
+            if (categories.length === 0) {
+                return res.status(404).json({ error: 'Category not found' });
+            }
+            
+            // Check if category has transactions
+            const [transactions] = await connection.query(
+                'SELECT COUNT(*) as count FROM transactions WHERE category_id = ?',
+                [categoryId]
+            );
+            
+            if (transactions[0].count > 0) {
+                return res.status(409).json({ 
+                    error: 'Cannot delete category with transactions',
+                    transactionCount: transactions[0].count
+                });
+            }
+            
+            // Delete category
+            await connection.query(
+                'DELETE FROM categories WHERE id = ?',
+                [categoryId]
+            );
+            
+            res.status(200).json({ message: 'Category deleted successfully' });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Delete category error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Transactions Routes
+
+// Get all transactions for user
+app.get('/api/transactions', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { startDate, endDate, categoryId, type } = req.query;
+        
+        let query = `
+            SELECT t.*, c.name as category_name, c.type as transaction_type, c.color, c.icon
+            FROM transactions t
+            JOIN categories c ON t.category_id = c.id
+            WHERE t.user_id = ?
+        `;
+        
+        const queryParams = [userId];
+        
+        // Add filters
+        if (startDate) {
+            query += ' AND t.transaction_date >= ?';
+            queryParams.push(startDate);
+        }
+        
+        if (endDate) {
+            query += ' AND t.transaction_date <= ?';
+            queryParams.push(endDate);
+        }
+        
+        if (categoryId) {
+            query += ' AND t.category_id = ?';
+            queryParams.push(categoryId);
+        }
+        
+        if (type) {
+            query += ' AND c.type = ?';
+            queryParams.push(type);
+        }
+        
+        query += ' ORDER BY t.transaction_date DESC, t.created_at DESC';
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            const [transactions] = await connection.query(query, queryParams);
+            
+            res.status(200).json(transactions);
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Get transactions error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Create new transaction
+app.post('/api/transactions', authenticateToken, async (req, res) => {
+    try {
+        const { categoryId, amount, description, transactionDate } = req.body;
+        const userId = req.user.id;
+        
+        // Validate input
+        if (!categoryId || !amount || !transactionDate) {
+            return res.status(400).json({ error: 'Category, amount and date are required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Check if category exists and belongs to user
+            const [categories] = await connection.query(
+                'SELECT * FROM categories WHERE id = ? AND user_id = ?',
+                [categoryId, userId]
+            );
+            
+            if (categories.length === 0) {
+                return res.status(404).json({ error: 'Category not found' });
+            }
+            
+            // Insert transaction
+            const [result] = await connection.query(
+                'INSERT INTO transactions (user_id, category_id, amount, description, transaction_date) VALUES (?, ?, ?, ?, ?)',
+                [userId, categoryId, amount, description || null, transactionDate]
+            );
+            
+            const [newTransaction] = await connection.query(
+                `SELECT t.*, c.name as category_name, c.type as transaction_type, c.color, c.icon
+                 FROM transactions t
+                 JOIN categories c ON t.category_id = c.id
+                 WHERE t.id = ?`,
+                [result.insertId]
+            );
+            
+            res.status(201).json(newTransaction[0]);
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Create transaction error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update transaction
+app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
+    try {
+        const transactionId = req.params.id;
+        const { categoryId, amount, description, transactionDate } = req.body;
+        const userId = req.user.id;
+        
+        // Validate input
+        if (!categoryId || !amount || !transactionDate) {
+            return res.status(400).json({ error: 'Category, amount and date are required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Check if transaction exists and belongs to user
+            const [transactions] = await connection.query(
+                'SELECT * FROM transactions WHERE id = ? AND user_id = ?',
+                [transactionId, userId]
+            );
+            
+            if (transactions.length === 0) {
+                return res.status(404).json({ error: 'Transaction not found' });
+            }
+            
+            // Check if category exists and belongs to user
+            const [categories] = await connection.query(
+                'SELECT * FROM categories WHERE id = ? AND user_id = ?',
+                [categoryId, userId]
+            );
+            
+            if (categories.length === 0) {
+                return res.status(404).json({ error: 'Category not found' });
+            }
+            
+            // Update transaction
+            await connection.query(
+                'UPDATE transactions SET category_id = ?, amount = ?, description = ?, transaction_date = ? WHERE id = ?',
+                [categoryId, amount, description || null, transactionDate, transactionId]
+            );
+            
+            const [updatedTransaction] = await connection.query(
+                `SELECT t.*, c.name as category_name, c.type as transaction_type, c.color, c.icon
+                 FROM transactions t
+                 JOIN categories c ON t.category_id = c.id
+                 WHERE t.id = ?`,
+                [transactionId]
+            );
+            
+            res.status(200).json(updatedTransaction[0]);
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Update transaction error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete transaction
+app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
+    try {
+        const transactionId = req.params.id;
+        const userId = req.user.id;
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Check if transaction exists and belongs to user
+            const [transactions] = await connection.query(
+                'SELECT * FROM transactions WHERE id = ? AND user_id = ?',
+                [transactionId, userId]
+            );
+            
+            if (transactions.length === 0) {
+                return res.status(404).json({ error: 'Transaction not found' });
+            }
+            
+            // Delete transaction
+            await connection.query(
+                'DELETE FROM transactions WHERE id = ?',
+                [transactionId]
+            );
+            
+            res.status(200).json({ message: 'Transaction deleted successfully' });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Delete transaction error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Summary and Statistics Routes
+
+// Get user's balance and summary
+app.get('/api/summary', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { startDate, endDate } = req.query;
+        
+        let dateFilter = '';
+        const queryParams = [userId];
+        
+        if (startDate && endDate) {
+            dateFilter = ' AND t.transaction_date BETWEEN ? AND ?';
+            queryParams.push(startDate, endDate);
+        } else if (startDate) {
+            dateFilter = ' AND t.transaction_date >= ?';
+            queryParams.push(startDate);
+        } else if (endDate) {
+            dateFilter = ' AND t.transaction_date <= ?';
+            queryParams.push(endDate);
+        }
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Total income
+            const [incomeResult] = await connection.query(
+                `SELECT COALESCE(SUM(t.amount), 0) as total
+                 FROM transactions t
+                 JOIN categories c ON t.category_id = c.id
+                 WHERE t.user_id = ? AND c.type = 'income'${dateFilter}`,
+                queryParams
+            );
+            
+            // Total expense
+            const [expenseResult] = await connection.query(
+                `SELECT COALESCE(SUM(t.amount), 0) as total
+                 FROM transactions t
+                 JOIN categories c ON t.category_id = c.id
+                 WHERE t.user_id = ? AND c.type = 'expense'${dateFilter}`,
+                queryParams
+            );
+            
+            // Income by category
+            const [incomeByCategory] = await connection.query(
+                `SELECT c.id, c.name, c.color, c.icon, COALESCE(SUM(t.amount), 0) as total
+                 FROM categories c
+                 LEFT JOIN transactions t ON c.id = t.category_id${dateFilter ? ` AND ${dateFilter.substring(5)}` : ''}
+                 WHERE c.user_id = ? AND c.type = 'income'
+                 GROUP BY c.id
+                 ORDER BY total DESC`,
+                dateFilter ? [userId, ...queryParams.slice(1), userId] : [userId, userId]
+            );
+            
+            // Expense by category
+            const [expenseByCategory] = await connection.query(
+                `SELECT c.id, c.name, c.color, c.icon, COALESCE(SUM(t.amount), 0) as total
+                 FROM categories c
+                 LEFT JOIN transactions t ON c.id = t.category_id${dateFilter ? ` AND ${dateFilter.substring(5)}` : ''}
+                 WHERE c.user_id = ? AND c.type = 'expense'
+                 GROUP BY c.id
+                 ORDER BY total DESC`,
+                dateFilter ? [userId, ...queryParams.slice(1), userId] : [userId, userId]
+            );
+            
+            // Monthly trend (for the last 6 months)
+            const [monthlyTrend] = await connection.query(
+                `SELECT 
+                    DATE_FORMAT(t.transaction_date, '%Y-%m') as month,
+                    c.type,
+                    SUM(t.amount) as total
+                 FROM transactions t
+                 JOIN categories c ON t.category_id = c.id
+                 WHERE t.user_id = ? AND t.transaction_date >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+                 GROUP BY month, c.type
+                 ORDER BY month`,
+                [userId]
+            );
+            
+            // Process monthly trend data
+            const months = {};
+            monthlyTrend.forEach(item => {
+                if (!months[item.month]) {
+                    months[item.month] = { income: 0, expense: 0 };
+                }
+                months[item.month][item.type] = parseFloat(item.total);
+            });
+            
+            const monthlyData = Object.keys(months).map(month => ({
+                month,
+                income: months[month].income,
+                expense: months[month].expense,
+                balance: months[month].income - months[month].expense
+            }));
+            
+            // Recent transactions
+            const [recentTransactions] = await connection.query(
+                `SELECT t.*, c.name as category_name, c.type as transaction_type, c.color, c.icon
+                 FROM transactions t
+                 JOIN categories c ON t.category_id = c.id
+                 WHERE t.user_id = ?
+                 ORDER BY t.transaction_date DESC, t.created_at DESC
+                 LIMIT 5`,
+                [userId]
+            );
+            
+            res.status(200).json({
+                balance: parseFloat(incomeResult[0].total) - parseFloat(expenseResult[0].total),
+                income: parseFloat(incomeResult[0].total),
+                expense: parseFloat(expenseResult[0].total),
+                incomeByCategory,
+                expenseByCategory,
+                monthlyTrend: monthlyData,
+                recentTransactions
+            });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Get summary error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Data Import/Export Routes
+
+// Import transactions from CSV
+app.post('/api/import', authenticateToken, upload.single('file'), async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+        
+        const filePath = req.file.path;
+        const importedTransactions = [];
+        const errors = [];
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Get user categories
+            const [categories] = await connection.query(
+                'SELECT id, name, type FROM categories WHERE user_id = ?',
+                [userId]
+            );
+            
+            const categoryMap = {};
+            categories.forEach(category => {
+                categoryMap[category.name.toLowerCase()] = {
+                    id: category.id,
+                    type: category.type
+                };
+            });
+            
+            // Process CSV file
+            const rows = [];
+            
+            fs.createReadStream(filePath)
+                .pipe(csv.parse({ headers: true, trim: true }))
+                .on('data', row => rows.push(row))
+                .on('end', async () => {
+                    // Process each row
+                    for (const row of rows) {
+                        try {
+                            // Validate required fields
+                            if (!row.amount || !row.category || !row.date) {
+                                errors.push({ row, error: 'Missing required fields' });
+                                continue;
+                            }
+                            
+                            // Find category
+                            const categoryName = row.category.trim().toLowerCase();
+                            const categoryId = categoryMap[categoryName]?.id;
+                            
+                            if (!categoryId) {
+                                errors.push({ row, error: 'Category not found' });
+                                continue;
+                            }
+                            
+                            // Parse date
+                            let transactionDate;
+                            try {
+                                transactionDate = new Date(row.date);
+                                if (isNaN(transactionDate.getTime())) {
+                                    errors.push({ row, error: 'Invalid date format' });
+                                    continue;
+                                }
+                                transactionDate = transactionDate.toISOString().split('T')[0];
+                            } catch (error) {
+                                errors.push({ row, error: 'Invalid date format' });
+                                continue;
+                            }
+                            
+                            // Parse amount
+                            let amount;
+                            try {
+                                amount = parseFloat(row.amount.replace(/[^0-9.-]+/g, ''));
+                                if (isNaN(amount)) {
+                                    errors.push({ row, error: 'Invalid amount format' });
+                                    continue;
+                                }
+                            } catch (error) {
+                                errors.push({ row, error: 'Invalid amount format' });
+                                continue;
+                            }
+                            
+                            // Insert transaction
+                            const [result] = await connection.query(
+                                'INSERT INTO transactions (user_id, category_id, amount, description, transaction_date) VALUES (?, ?, ?, ?, ?)',
+                                [userId, categoryId, amount, row.description || null, transactionDate]
+                            );
+                            
+                            importedTransactions.push({
+                                id: result.insertId,
+                                category: row.category,
+                                amount,
+                                description: row.description,
+                                date: transactionDate
+                            });
+                        } catch (error) {
+                            errors.push({ row, error: error.message });
+                        }
+                    }
+                    
+                    // Clean up file
+                    fs.unlinkSync(filePath);
+                    
+                    res.status(200).json({
+                        success: true,
+                        imported: importedTransactions.length,
+                        errors: errors.length,
+                        errorDetails: errors
+                    });
+                });
+        } catch (error) {
+            // Clean up file on error
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
+            throw error;
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Import error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Export transactions to CSV
+app.get('/api/export', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { startDate, endDate, categoryId, type } = req.query;
+        
+        let query = `
+            SELECT 
+                t.id,
+                t.transaction_date as date,
+                c.name as category,
+                c.type as type,
+                t.amount,
+                t.description
+            FROM transactions t
+            JOIN categories c ON t.category_id = c.id
+            WHERE t.user_id = ?
+        `;
+        
+        const queryParams = [userId];
+        
+        // Add filters
+        if (startDate) {
+            query += ' AND t.transaction_date >= ?';
+            queryParams.push(startDate);
+        }
+        
+        if (endDate) {
+            query += ' AND t.transaction_date <= ?';
+            queryParams.push(endDate);
+        }
+        
+        if (categoryId) {
+            query += ' AND t.category_id = ?';
+            queryParams.push(categoryId);
+        }
+        
+        if (type) {
+            query += ' AND c.type = ?';
+            queryParams.push(type);
+        }
+        
+        query += ' ORDER BY t.transaction_date DESC';
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            const [transactions] = await connection.query(query, queryParams);
+            
+            if (transactions.length === 0) {
+                return res.status(404).json({ error: 'No transactions found for the selected filters' });
+            }
+            
+            // Convert to CSV
+            const fields = ['date', 'category', 'type', 'amount', 'description'];
+            const opts = { fields };
+            
+            try {
+                const parser = new Parser(opts);
+                const csv = parser.parse(transactions);
+                
+                // Set response headers
+                res.setHeader('Content-Type', 'text/csv');
+                res.setHeader('Content-Disposition', 'attachment; filename=transactions.csv');
+                
+                // Send CSV as response
+                res.status(200).send(csv);
+            } catch (err) {
+                console.error('Error converting to CSV:', err);
+                res.status(500).json({ error: 'Error generating CSV file' });
+            }
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Export error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Monthly statistics
+app.get('/api/statistics/monthly', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { year } = req.query;
+        
+        const currentYear = new Date().getFullYear();
+        const targetYear = year ? parseInt(year) : currentYear;
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            // Monthly income and expense
+            const [monthlyData] = await connection.query(
+                `SELECT 
+                    MONTH(t.transaction_date) as month,
+                    c.type,
+                    SUM(t.amount) as total
+                 FROM transactions t
+                 JOIN categories c ON t.category_id = c.id
+                 WHERE t.user_id = ? AND YEAR(t.transaction_date) = ?
+                 GROUP BY month, c.type
+                 ORDER BY month`,
+                [userId, targetYear]
+            );
+            
+            // Process data into an array of 12 months
+            const monthlyStats = Array.from({ length: 12 }, (_, i) => ({
+                month: i + 1,
+                income: 0,
+                expense: 0,
+                balance: 0
+            }));
+            
+            monthlyData.forEach(item => {
+                const monthIndex = item.month - 1;
+                if (item.type === 'income') {
+                    monthlyStats[monthIndex].income = parseFloat(item.total);
+                } else if (item.type === 'expense') {
+                    monthlyStats[monthIndex].expense = parseFloat(item.total);
+                }
+                monthlyStats[monthIndex].balance = monthlyStats[monthIndex].income - monthlyStats[monthIndex].expense;
+            });
+            
+            res.status(200).json({
+                year: targetYear,
+                months: monthlyStats
+            });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Get monthly statistics error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Category statistics
+app.get('/api/statistics/categories', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { startDate, endDate, type } = req.query;
+        
+        let dateFilter = '';
+        const queryParams = [userId];
+        
+        if (startDate && endDate) {
+            dateFilter = ' AND t.transaction_date BETWEEN ? AND ?';
+            queryParams.push(startDate, endDate);
+        } else if (startDate) {
+            dateFilter = ' AND t.transaction_date >= ?';
+            queryParams.push(startDate);
+        } else if (endDate) {
+            dateFilter = ' AND t.transaction_date <= ?';
+            queryParams.push(endDate);
+        }
+        
+        const transactionType = type || 'expense';
+        queryParams.push(transactionType);
+        
+        const connection = await pool.getConnection();
+        
+        try {
+            const [categoryData] = await connection.query(
+                `SELECT 
+                    c.id,
+                    c.name,
+                    c.color,
+                    c.icon,
+                    SUM(t.amount) as total,
+                    COUNT(t.id) as count
+                FROM categories c
+                LEFT JOIN transactions t ON c.id = t.category_id${dateFilter}
+                WHERE c.user_id = ? AND c.type = ?
+                GROUP BY c.id
+                ORDER BY total DESC`,
+                queryParams
+            );
+            
+            // Calculate percentages
+            const totalAmount = categoryData.reduce((sum, item) => sum + parseFloat(item.total || 0), 0);
+            
+            const categoriesWithPercentage = categoryData.map(category => ({
+                ...category,
+                total: parseFloat(category.total || 0),
+                percentage: totalAmount ? ((parseFloat(category.total || 0) / totalAmount) * 100).toFixed(2) : 0
+            }));
+            
+            res.status(200).json({
+                type: transactionType,
+                totalAmount,
+                categories: categoriesWithPercentage
+            });
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Get category statistics error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Serve frontend app
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+
+// FRONTEND IMPLEMENTATION
+
+// index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Personal Finance Tracker</title>
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Auth Container (Login/Register) -->
+        <div id="auth-container" class="auth-container">
+            <div class="auth-card">
+                <div class="auth-header">
+                    <h1>Finance Tracker</h1>
+                    <div class="tabs">
+                        <button class="tab-btn active" data-tab="login">Login</button>
+                        <button class="tab-btn" data-tab="register">Register</button>
+                    </div>
+                </div>
+                
+                <!-- Login Form -->
+                <form id="login-form" class="auth-form active">
+                    <div class="form-group">
+                        <label for="login-email">Email</label>
+                        <input type="email" id="login-email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="login-password">Password</label>
+                        <input type="password" id="login-password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Login</button>
+                    <div id="login-error" class="error-message"></div>
+                </form>
+                
+                <!-- Register Form -->
+                <form id="register-form" class="auth-form">
+                    <div class="form-group">
+                        <label for="register-username">Username</label>
+                        <input type="text" id="register-username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-email">Email</label>
+                        <input type="email" id="register-email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-password">Password</label>
+                        <input type="password" id="register-password" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-confirm">Confirm Password</label>
+                        <input type="password" id="register-confirm" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Register</button>
+                    <div id="register-error" class="error-message"></div>
+                </form>
+            </div>
+        </div>
+        
+        <!-- App Container (Main Application) -->
+        <div id="app-container" class="app-container" style="display: none;">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <div class="sidebar-header">
+                    <h1>Finance Tracker</h1>
+                    <button id="toggle-sidebar" class="toggle-sidebar">
+                        <span class="material-icons">menu</span>
+                    </button>
+                </div>
+                
+                <nav class="sidebar-nav">
+                    <ul>
+                        <li>
+                            <a href="#dashboard" class="nav-link active">
+                                <span class="material-icons">dashboard</span>
+                                <span class="nav-text">Dashboard</span>
+                            </a>
+                        </li>
+                        <li>
+                            <a href="#transactions" class="nav-link">
+                                <span class="material-icons">receipt_long</span>
+                                <span class="nav-text">Transactions</span>
+                            </a>
+                        </li>
+                        <li>
+                            <a href="#categories" class="nav-link">
+                                <span class="material-icons">category</span>
+                                <span class="nav-text">Categories</span>
+                            </a>
+                        </li>
+                        <li>
+                            <a href="#reports" class="nav-link">
+                                <span class="material-icons">bar_chart</span>
+                                <span class="nav-text">Reports</span>
+                            </a>
+                        </li>
+                        <li>
+                            <a href="#import-export" class="nav-link">
+                                <span class="material-icons">import_export</span>
+                                <span class="nav-text">Import/Export</span>
+                            </a>
+                        </li>
+                    </ul>
+                </nav>
+                
+                <div class="sidebar-footer">
+                    <div id="user-info" class="user-info">
+                        <span class="material-icons">account_circle</span>
+                        <span id="username" class="username">User</span>
+                    </div>
+                    <button id="logout-btn" class="btn btn-text">
+                        <span class="material-icons">logout</span>
+                        <span>Logout</span>
+                    </button>
+                </div>
+            </aside>
+            
+            <!-- Main Content -->
+            <main class="main-content">
+                <!-- Date Filter -->
+                <div class="date-filter">
+                    <div class="filter-group">
+                        <label for="period-select">Period:</label>
+                        <select id="period-select">
+                            <option value="all">All Time</option>
+                            <option value="this-month" selected>This Month</option>
+                            <option value="last-month">Last Month</option>
+                            <option value="this-year">This Year</option>
+                            <option value="custom">Custom</option>
+                        </select>
+                    </div>
+                    
+                    <div id="custom-date-range" class="custom-date-range" style="display: none;">
+                        <div class="filter-group">
+                            <label for="start-date">From:</label>
+                            <input type="date" id="start-date">
+                        </div>
+                        <div class="filter-group">
+                            <label for="end-date">To:</label>
+                            <input type="date" id="end-date">
+                        </div>
+                        <button id="apply-date-filter" class="btn btn-small">Apply</button>
+                    </div>
+                </div>
+                
+                <!-- Dashboard Page -->
+                <section id="dashboard-page" class="page active">
+                    <div class="page-header">
+                        <h2>Dashboard</h2>
+                    </div>
+                    
+                    <!-- Summary Cards -->
+                    <div class="summary-cards">
+                        <div class="card summary-card">
+                            <div class="card-content">
+                                <h3>Balance</h3>
+                                <div class="amount" id="balance-amount">$0.00</div>
+                            </div>
+                            <div class="card-icon">
+                                <span class="material-icons">account_balance_wallet</span>
+                            </div>
+                        </div>
+                        
+                        <div class="card summary-card income-card">
+                            <div class="card-content">
+                                <h3>Income</h3>
+                                <div class="amount" id="income-amount">$0.00</div>
+                            </div>
+                            <div class="card-icon">
+                                <span class="material-icons">trending_up</span>
+                            </div>
+                        </div>
+                        
+                        <div class="card summary-card expense-card">
+                            <div class="card-content">
+                                <h3>Expenses</h3>
+                                <div class="amount" id="expense-amount">$0.00</div>
+                            </div>
+                            <div class="card-icon">
+                                <span class="material-icons">trending_down</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Charts -->
+                    <div class="dashboard-charts">
+                        <div class="card chart-card">
+                            <div class="card-header">
+                                <h3>Monthly Overview</h3>
+                            </div>
+                            <div class="card-body">
+                                <canvas id="monthly-chart"></canvas>
+                            </div>
+                        </div>
+                        
+                        <div class="card chart-card">
+                            <div class="card-header">
+                                <h3>Expense Breakdown</h3>
+                            </div>
+                            <div class="card-body">
+                                <canvas id="expense-chart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Recent Transactions -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>Recent Transactions</h3>
+                            <a href="#transactions" class="btn btn-text">View All</a>
+                        </div>
+                        <div class="card-body">
+                            <div id="recent-transactions" class="transaction-list">
+                                <div class="loading">Loading transactions...</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+                
+                <!-- Transactions Page -->
+                <section id="transactions-page" class="page">
+                    <div class="page-header">
+                        <h2>Transactions</h2>
+                        <button id="add-transaction-btn" class="btn btn-primary">
+                            <span class="material-icons">add</span>
+                            Add Transaction
+                        </button>
+                    </div>
+                    
+                    <!-- Transaction Filters -->
+                    <div class="transaction-filters">
+                        <div class="filter-group">
+                            <label for="transaction-type-filter">Type:</label>
+                            <select id="transaction-type-filter">
+                                <option value="all">All</option>
+                                <option value="income">Income</option>
+                                <option value="expense">Expense</option>
+                            </select>
+                        </div>
+                        
+                        <div class="filter-group">
+                            <label for="category-filter">Category:</label>
+                            <select id="category-filter">
+                                <option value="all">All Categories</option>
+                                <!-- Categories will be loaded dynamically -->
+                            </select>
+                        </div>
+                        
+                        <div class="filter-group search-group">
+                            <input type="text" id="search-transactions" placeholder="Search transactions...">
+                            <button id="search-btn" class="btn btn-icon">
+                                <span class="material-icons">search</span>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Transactions List -->
+                    <div class="card">
+                        <div class="card-body">
+                            <div id="transactions-list" class="transaction-list">
+                                <div class="loading">Loading transactions...</div>
+                            </div>
+                            
+                            <div class="pagination">
+                                <button id="prev-page" class="btn btn-icon" disabled>
+                                    <span class="material-icons">chevron_left</span>
+                                </button>
+                                <span id="page-info">Page 1</span>
+                                <button id="next-page" class="btn btn-icon" disabled>
+                                    <span class="material-icons">chevron_right</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+                
+                <!-- Categories Page -->
+                <section id="categories-page" class="page">
+                    <div class="page-header">
+                        <h2>Categories</h2>
+                        <button id="add-category-btn" class="btn btn-primary">
+                            <span class="material-icons">add</span>
+                            Add Category
+                        </button>
+                    </div>
+                    
+                    <!-- Category Tabs -->
+                    <div class="tabs">
+                        <button class="tab-btn active" data-tab="expense-categories">Expense Categories</button>
+                        <button class="tab-btn" data-tab="income-categories">Income Categories</button>
+                    </div>
+                    
+                    <!-- Expense Categories -->
+                    <div id="expense-categories" class="tab-content active">
+                        <div class="categories-grid" id="expense-categories-grid">
+                            <div class="loading">Loading categories...</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Income Categories -->
+                    <div id="income-categories" class="tab-content">
+                        <div class="categories-grid" id="income-categories-grid">
+                            <div class="loading">Loading categories...</div>
+                        </div>
+                    </div>
+                </section>
+                
+                <!-- Reports Page -->
+                <section id="reports-page" class="page">
+                    <div class="page-header">
+                        <h2>Reports</h2>
+                    </div>
+                    
+                    <!-- Report Types -->
+                    <div class="tabs">
+                        <button class="tab-btn active" data-tab="monthly-report">Monthly</button>
+                        <button class="tab-btn" data-tab="category-report">By Category</button>
+                        <button class="tab-btn" data-tab="trend-report">Trends</button>
+                    </div>
+                    
+                    <!-- Monthly Report -->
+                    <div id="monthly-report" class="tab-content active">
+                        <div class="report-filters">
+                            <div class="filter-group">
+                                <label for="year-select">Year:</label>
+                                <select id="year-select">
+                                    <!-- Years will be loaded dynamically -->
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="card chart-card">
+                            <div class="card-header">
+                                <h3>Monthly Income and Expenses</h3>
+                            </div>
+                            <div class="card-body">
+                                <canvas id="monthly-report-chart"></canvas>
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Monthly Summary</h3>
+                            </div>
+                            <div class="card-body">
+                                <table class="data-table" id="monthly-summary-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Month</th>
+                                            <th>Income</th>
+                                            <th>Expenses</th>
+                                            <th>Balance</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <!-- Data will be loaded dynamically -->
+                                    </tbody>
+                                    <tfoot>
+                                        <tr>
+                                            <th>Total</th>
+                                            <th id="total-income">$0.00</th>
+                                            <th id="total-expenses">$0.00</th>
+                                            <th id="total-balance">$0.00</th>
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Category Report -->
+                    <div id="category-report" class="tab-content">
+                        <div class="report-filters">
+                            <div class="filter-group">
+                                <label for="category-type-select">Type:</label>
+                                <select id="category-type-select">
+                                    <option value="expense">Expenses</option>
+                                    <option value="income">Income</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="report-charts">
+                            <div class="card chart-card">
+                                <div class="card-header">
+                                    <h3>Expense Breakdown</h3>
+                                </div>
+                                <div class="card-body">
+                                    <canvas id="category-pie-chart"></canvas>
+                                </div>
+                            </div>
+                            
+                            <div class="card chart-card">
+                                <div class="card-header">
+                                    <h3>Comparison</h3>
+                                </div>
+                                <div class="card-body">
+                                    <canvas id="category-bar-chart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Category Details</h3>
+                            </div>
+                            <div class="card-body">
+                                <table class="data-table" id="category-details-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Category</th>
+                                            <th>Amount</th>
+                                            <th>Percentage</th>
+                                            <th>Transactions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <!-- Data will be loaded dynamically -->
+                                    </tbody>
+                                    <tfoot>
+                                        <tr>
+                                            <th>Total</th>
+                                            <th id="category-total-amount">$0.00</th>
+                                            <th>100%</th>
+                                            <th id="category-total-transactions">0</th>
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Trend Report -->
+                    <div id="trend-report" class="tab-content">
+                        <div class="card chart-card">
+                            <div class="card-header">
+                                <h3>Income vs Expenses Trend</h3>
+                            </div>
+                            <div class="card-body">
+                                <canvas id="trend-chart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+                
+                <!-- Import/Export Page -->
+                <section id="import-export-page" class="page">
+                    <div class="page-header">
+                        <h2>Import/Export</h2>
+                    </div>
+                    
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>Import Transactions</h3>
+                        </div>
+                        <div class="card-body">
+                            <form id="import-form">
+                                <div class="form-group">
+                                    <label for="import-file">Upload CSV File:</label>
+                                    <input type="file" id="import-file" accept=".csv">
+                                    <p class="form-help">
+                                        The CSV file should have the following columns: date, category, amount, description
+                                    </p>
+                                </div>
+                                <button type="submit" class="btn btn-primary">
+                                    <span class="material-icons">upload</span>
+                                    Import
+                                </button>
+                            </form>
+                            
+                            <div id="import-result" class="import-result" style="display: none;">
+                                <h4>Import Result:</h4>
+                                <div id="import-summary"></div>
+                                <div id="import-errors" style="display: none;">
+                                    <h5>Errors:</h5>
+                                    <ul id="error-list"></ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>Export Transactions</h3>
+                        </div>
+                        <div class="card-body">
+                            <form id="export-form">
+                                <div class="form-group">
+                                    <label for="export-type">Export Type:</label>
+                                    <select id="export-type">
+                                        <option value="all">All Transactions</option>
+                                        <option value="filtered">Current Filtered Transactions</option>
+                                    </select>
+                                </div>
+                                <button type="submit" class="btn btn-primary">
+                                    <span class="material-icons">download</span>
+                                    Export to CSV
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </section>
+            </main>
+        </div>
+        
+        <!-- Modals -->
+        
+        <!-- Transaction Modal -->
+        <div id="transaction-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="transaction-modal-title">Add Transaction</h3>
+                    <button class="modal-close">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form id="transaction-form">
+                        <input type="hidden" id="transaction-id">
+                        
+                        <div class="form-group">
+                            <label for="transaction-type">Type:</label>
+                            <select id="transaction-type" required>
+                                <option value="expense">Expense</option>
+                                <option value="income">Income</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="transaction-category">Category:</label>
+                            <select id="transaction-category" required>
+                                <option value="">Select Category</option>
+                                <!-- Categories will be loaded dynamically -->
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="transaction-amount">Amount:</label>
+                            <input type="number" id="transaction-amount" step="0.01" min="0.01" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="transaction-date">Date:</label>
+                            <input type="date" id="transaction-date" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="transaction-description">Description:</label>
+                            <textarea id="transaction-description" rows="3"></textarea>
+                        </div>
+                        
+                        <div class="form-buttons">
+                            <button type="button" id="delete-transaction-btn" class="btn btn-danger" style="display: none;">Delete</button>
+                            <button type="submit" class="btn btn-primary">Save</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Category Modal -->
+        <div id="category-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="category-modal-title">Add Category</h3>
+                    <button class="modal-close">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form id="category-form">
+                        <input type="hidden" id="category-id">
+                        
+                        <div class="form-group">
+                            <label for="category-type">Type:</label>
+                            <select id="category-type" required>
+                                <option value="expense">Expense</option>
+                                <option value="income">Income</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="category-name">Name:</label>
+                            <input type="text" id="category-name" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="category-icon">Icon:</label>
+                            <select id="category-icon">
+                                <option value="shopping_cart">Shopping 

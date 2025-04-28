@@ -1,0 +1,2809 @@
+// DATABASE SCHEMA (MySQL)
+
+-- Database Creation
+CREATE DATABASE IF NOT EXISTS survey_app;
+USE survey_app;
+
+-- Users Table
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    is_admin BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP NULL
+);
+
+-- Surveys Table
+CREATE TABLE surveys (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    created_by INT NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    end_date TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Questions Table
+CREATE TABLE questions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    survey_id INT NOT NULL,
+    question_text TEXT NOT NULL,
+    question_type ENUM('text', 'textarea', 'radio', 'checkbox', 'dropdown', 'scale', 'date') NOT NULL,
+    is_required BOOLEAN DEFAULT FALSE,
+    position INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (survey_id) REFERENCES surveys(id) ON DELETE CASCADE
+);
+
+-- Options Table (for multiple choice questions)
+CREATE TABLE options (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    question_id INT NOT NULL,
+    option_text VARCHAR(255) NOT NULL,
+    position INT NOT NULL,
+    FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+);
+
+-- Responses Table (metadata about a user's response to a survey)
+CREATE TABLE responses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    survey_id INT NOT NULL,
+    user_id INT NULL, -- NULL for anonymous responses
+    ip_address VARCHAR(45) NULL,
+    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (survey_id) REFERENCES surveys(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- Answers Table (individual question answers)
+CREATE TABLE answers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    response_id INT NOT NULL,
+    question_id INT NOT NULL,
+    answer_text TEXT NULL,
+    FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE,
+    FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+);
+
+-- Selected Options Table (for multiple choice answers)
+CREATE TABLE selected_options (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    answer_id INT NOT NULL,
+    option_id INT NOT NULL,
+    FOREIGN KEY (answer_id) REFERENCES answers(id) ON DELETE CASCADE,
+    FOREIGN KEY (option_id) REFERENCES options(id) ON DELETE CASCADE
+);
+
+
+// BACKEND IMPLEMENTATION (Node.js with Express)
+
+// app.js - Main server file
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+const dotenv = require('dotenv');
+
+// Load environment variables
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Database connection
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'survey_app',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Access denied' });
+    
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+};
+
+// Admin middleware
+const isAdmin = async (req, res, next) => {
+    try {
+        const connection = await pool.getConnection();
+        const [rows] = await connection.query(
+            'SELECT is_admin FROM users WHERE id = ?',
+            [req.user.id]
+        );
+        connection.release();
+        
+        if (rows.length === 0 || !rows[0].is_admin) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+        
+        next();
+    } catch (error) {
+        console.error('Admin check error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// ROUTES
+
+// Authentication Routes
+app.post('/api/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        
+        // Validate input
+        if (!username || !email || !password) {
+            return res.status(400).json({ error: 'All fields are required' });
+        }
+        
+        // Hash password
+        const saltRounds = 10;
+        const hashedPassword = await bcrypt.hash(password, saltRounds);
+        
+        const connection = await pool.getConnection();
+        
+        // Check if user already exists
+        const [existingUsers] = await connection.query(
+            'SELECT * FROM users WHERE username = ? OR email = ?',
+            [username, email]
+        );
+        
+        if (existingUsers.length > 0) {
+            connection.release();
+            return res.status(409).json({ error: 'Username or email already exists' });
+        }
+        
+        // Insert new user
+        const [result] = await connection.query(
+            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+            [username, email, hashedPassword]
+        );
+        
+        connection.release();
+        
+        res.status(201).json({ 
+            message: 'User registered successfully',
+            userId: result.insertId
+        });
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        // Validate input
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        // Find user
+        const [users] = await connection.query(
+            'SELECT * FROM users WHERE email = ?',
+            [email]
+        );
+        
+        if (users.length === 0) {
+            connection.release();
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const user = users[0];
+        
+        // Compare password
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        if (!validPassword) {
+            connection.release();
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        // Update last login
+        await connection.query(
+            'UPDATE users SET last_login = NOW() WHERE id = ?',
+            [user.id]
+        );
+        
+        connection.release();
+        
+        // Generate token
+        const token = jwt.sign(
+            { id: user.id, username: user.username, isAdmin: user.is_admin },
+            process.env.JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+        
+        res.status(200).json({
+            message: 'Login successful',
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                isAdmin: user.is_admin
+            }
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Survey Routes
+
+// Get all surveys (public)
+app.get('/api/surveys', async (req, res) => {
+    try {
+        const connection = await pool.getConnection();
+        
+        const [surveys] = await connection.query(
+            `SELECT s.id, s.title, s.description, s.is_active, 
+             s.start_date, s.end_date, u.username as created_by_username,
+             (SELECT COUNT(*) FROM questions WHERE survey_id = s.id) as question_count
+             FROM surveys s
+             JOIN users u ON s.created_by = u.id
+             WHERE s.is_active = 1
+             ORDER BY s.created_at DESC`
+        );
+        
+        connection.release();
+        
+        res.status(200).json(surveys);
+    } catch (error) {
+        console.error('Fetch surveys error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get survey by ID (with questions and options)
+app.get('/api/surveys/:id', async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const connection = await pool.getConnection();
+        
+        // Get survey
+        const [surveys] = await connection.query(
+            `SELECT s.*, u.username as created_by_username
+             FROM surveys s
+             JOIN users u ON s.created_by = u.id
+             WHERE s.id = ?`,
+            [surveyId]
+        );
+        
+        if (surveys.length === 0) {
+            connection.release();
+            return res.status(404).json({ error: 'Survey not found' });
+        }
+        
+        const survey = surveys[0];
+        
+        // Get questions
+        const [questions] = await connection.query(
+            `SELECT * FROM questions
+             WHERE survey_id = ?
+             ORDER BY position ASC`,
+            [surveyId]
+        );
+        
+        // Get options for all questions
+        const [options] = await connection.query(
+            `SELECT o.* FROM options o
+             JOIN questions q ON o.question_id = q.id
+             WHERE q.survey_id = ?
+             ORDER BY o.position ASC`,
+            [surveyId]
+        );
+        
+        // Map options to questions
+        const questionsWithOptions = questions.map(question => {
+            const questionOptions = options.filter(option => option.question_id === question.id);
+            return {
+                ...question,
+                options: questionOptions
+            };
+        });
+        
+        survey.questions = questionsWithOptions;
+        
+        connection.release();
+        
+        res.status(200).json(survey);
+    } catch (error) {
+        console.error('Fetch survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Submit survey response
+app.post('/api/surveys/:id/respond', async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const { answers } = req.body;
+        const userId = req.headers.authorization ? jwt.decode(req.headers.authorization.split(' ')[1])?.id : null;
+        const ipAddress = req.ip;
+        
+        const connection = await pool.getConnection();
+        
+        // Start transaction
+        await connection.beginTransaction();
+        
+        try {
+            // Create response
+            const [responseResult] = await connection.query(
+                'INSERT INTO responses (survey_id, user_id, ip_address) VALUES (?, ?, ?)',
+                [surveyId, userId, ipAddress]
+            );
+            
+            const responseId = responseResult.insertId;
+            
+            // Insert answers
+            for (const answer of answers) {
+                const { questionId, answerText, selectedOptions } = answer;
+                
+                // Insert answer text
+                const [answerResult] = await connection.query(
+                    'INSERT INTO answers (response_id, question_id, answer_text) VALUES (?, ?, ?)',
+                    [responseId, questionId, answerText || null]
+                );
+                
+                const answerId = answerResult.insertId;
+                
+                // Insert selected options if any
+                if (selectedOptions && selectedOptions.length > 0) {
+                    for (const optionId of selectedOptions) {
+                        await connection.query(
+                            'INSERT INTO selected_options (answer_id, option_id) VALUES (?, ?)',
+                            [answerId, optionId]
+                        );
+                    }
+                }
+            }
+            
+            // Commit transaction
+            await connection.commit();
+            
+            connection.release();
+            
+            res.status(201).json({
+                message: 'Survey response submitted successfully',
+                responseId
+            });
+        } catch (error) {
+            // Rollback transaction on error
+            await connection.rollback();
+            connection.release();
+            throw error;
+        }
+    } catch (error) {
+        console.error('Submit response error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Admin Routes (protected)
+
+// Create a new survey
+app.post('/api/admin/surveys', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const { title, description, questions } = req.body;
+        const userId = req.user.id;
+        
+        if (!title) {
+            return res.status(400).json({ error: 'Survey title is required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        // Start transaction
+        await connection.beginTransaction();
+        
+        try {
+            // Create survey
+            const [surveyResult] = await connection.query(
+                'INSERT INTO surveys (title, description, created_by) VALUES (?, ?, ?)',
+                [title, description || null, userId]
+            );
+            
+            const surveyId = surveyResult.insertId;
+            
+            // Add questions
+            if (questions && questions.length > 0) {
+                for (let i = 0; i < questions.length; i++) {
+                    const q = questions[i];
+                    
+                    const [questionResult] = await connection.query(
+                        `INSERT INTO questions 
+                         (survey_id, question_text, question_type, is_required, position)
+                         VALUES (?, ?, ?, ?, ?)`,
+                        [surveyId, q.questionText, q.questionType, q.isRequired || false, i + 1]
+                    );
+                    
+                    const questionId = questionResult.insertId;
+                    
+                    // Add options for multiple choice questions
+                    if (['radio', 'checkbox', 'dropdown'].includes(q.questionType) && q.options && q.options.length > 0) {
+                        for (let j = 0; j < q.options.length; j++) {
+                            await connection.query(
+                                'INSERT INTO options (question_id, option_text, position) VALUES (?, ?, ?)',
+                                [questionId, q.options[j], j + 1]
+                            );
+                        }
+                    }
+                }
+            }
+            
+            // Commit transaction
+            await connection.commit();
+            
+            connection.release();
+            
+            res.status(201).json({
+                message: 'Survey created successfully',
+                surveyId
+            });
+        } catch (error) {
+            // Rollback transaction on error
+            await connection.rollback();
+            connection.release();
+            throw error;
+        }
+    } catch (error) {
+        console.error('Create survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update a survey
+app.put('/api/admin/surveys/:id', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const { title, description, questions, isActive, endDate } = req.body;
+        
+        const connection = await pool.getConnection();
+        
+        // Start transaction
+        await connection.beginTransaction();
+        
+        try {
+            // Update survey
+            await connection.query(
+                'UPDATE surveys SET title = ?, description = ?, is_active = ?, end_date = ? WHERE id = ?',
+                [title, description || null, isActive, endDate || null, surveyId]
+            );
+            
+            if (questions) {
+                // Delete existing questions and options
+                await connection.query('DELETE FROM questions WHERE survey_id = ?', [surveyId]);
+                
+                // Add updated questions
+                for (let i = 0; i < questions.length; i++) {
+                    const q = questions[i];
+                    
+                    const [questionResult] = await connection.query(
+                        `INSERT INTO questions 
+                         (survey_id, question_text, question_type, is_required, position)
+                         VALUES (?, ?, ?, ?, ?)`,
+                        [surveyId, q.questionText, q.questionType, q.isRequired || false, i + 1]
+                    );
+                    
+                    const questionId = questionResult.insertId;
+                    
+                    // Add options for multiple choice questions
+                    if (['radio', 'checkbox', 'dropdown'].includes(q.questionType) && q.options && q.options.length > 0) {
+                        for (let j = 0; j < q.options.length; j++) {
+                            await connection.query(
+                                'INSERT INTO options (question_id, option_text, position) VALUES (?, ?, ?)',
+                                [questionId, q.options[j], j + 1]
+                            );
+                        }
+                    }
+                }
+            }
+            
+            // Commit transaction
+            await connection.commit();
+            
+            connection.release();
+            
+            res.status(200).json({
+                message: 'Survey updated successfully'
+            });
+        } catch (error) {
+            // Rollback transaction on error
+            await connection.rollback();
+            connection.release();
+            throw error;
+        }
+    } catch (error) {
+        console.error('Update survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete a survey
+app.delete('/api/admin/surveys/:id', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        
+        const connection = await pool.getConnection();
+        await connection.query('DELETE FROM surveys WHERE id = ?', [surveyId]);
+        connection.release();
+        
+        res.status(200).json({
+            message: 'Survey deleted successfully'
+        });
+    } catch (error) {
+        console.error('Delete survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get survey results
+app.get('/api/admin/surveys/:id/results', authenticateToken, async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const userId = req.user.id;
+        
+        const connection = await pool.getConnection();
+        
+        // Check if user is admin or survey creator
+        const [surveys] = await connection.query(
+            'SELECT created_by FROM surveys WHERE id = ?',
+            [surveyId]
+        );
+        
+        if (surveys.length === 0) {
+            connection.release();
+            return res.status(404).json({ error: 'Survey not found' });
+        }
+        
+        const [users] = await connection.query(
+            'SELECT is_admin FROM users WHERE id = ?',
+            [userId]
+        );
+        
+        if (surveys[0].created_by !== userId && !users[0].is_admin) {
+            connection.release();
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        
+        // Get survey and questions
+        const [surveyInfo] = await connection.query(
+            'SELECT title, description FROM surveys WHERE id = ?',
+            [surveyId]
+        );
+        
+        // Get questions
+        const [questions] = await connection.query(
+            'SELECT id, question_text, question_type FROM questions WHERE survey_id = ? ORDER BY position',
+            [surveyId]
+        );
+        
+        // Get response count
+        const [responseCount] = await connection.query(
+            'SELECT COUNT(*) as count FROM responses WHERE survey_id = ?',
+            [surveyId]
+        );
+        
+        // Process each question to get answer stats
+        const questionsWithStats = await Promise.all(questions.map(async (question) => {
+            const questionStats = { ...question };
+            
+            if (['radio', 'checkbox', 'dropdown'].includes(question.question_type)) {
+                // For multiple choice questions, get option stats
+                const [options] = await connection.query(
+                    `SELECT o.id, o.option_text, COUNT(so.id) as selection_count
+                     FROM options o
+                     LEFT JOIN selected_options so ON o.id = so.option_id
+                     LEFT JOIN answers a ON so.answer_id = a.id 
+                     LEFT JOIN responses r ON a.response_id = r.id AND r.survey_id = ?
+                     WHERE o.question_id = ?
+                     GROUP BY o.id
+                     ORDER BY o.position`,
+                    [surveyId, question.id]
+                );
+                
+                questionStats.options = options;
+            } else {
+                // For text questions, get sample answers
+                const [textAnswers] = await connection.query(
+                    `SELECT a.answer_text
+                     FROM answers a
+                     JOIN responses r ON a.response_id = r.id
+                     WHERE a.question_id = ? AND r.survey_id = ?
+                     ORDER BY r.submitted_at DESC
+                     LIMIT 10`,
+                    [question.id, surveyId]
+                );
+                
+                questionStats.sampleAnswers = textAnswers.map(a => a.answer_text);
+            }
+            
+            return questionStats;
+        }));
+        
+        const results = {
+            surveyInfo: surveyInfo[0],
+            responseCount: responseCount[0].count,
+            questions: questionsWithStats
+        };
+        
+        connection.release();
+        
+        res.status(200).json(results);
+    } catch (error) {
+        console.error('Fetch results error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get all surveys for admin
+app.get('/api/admin/surveys', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const connection = await pool.getConnection();
+        
+        const [surveys] = await connection.query(
+            `SELECT s.id, s.title, s.description, s.is_active, 
+             s.start_date, s.end_date, s.created_at, 
+             u.username as created_by_username,
+             (SELECT COUNT(*) FROM questions WHERE survey_id = s.id) as question_count,
+             (SELECT COUNT(*) FROM responses WHERE survey_id = s.id) as response_count
+             FROM surveys s
+             JOIN users u ON s.created_by = u.id
+             ORDER BY s.created_at DESC`
+        );
+        
+        connection.release();
+        
+        res.status(200).json(surveys);
+    } catch (error) {
+        console.error('Fetch admin surveys error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Serve the frontend app
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+module.exports = app;
+
+
+// FRONTEND IMPLEMENTATION (HTML, CSS, JavaScript)
+
+// index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Survey Application</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="container">
+                <div class="logo">
+                    <i class="fas fa-poll"></i>
+                    <h1>SurveyApp</h1>
+                </div>
+                <nav class="nav">
+                    <ul id="main-nav">
+                        <li><a href="#" data-page="home" class="active">Home</a></li>
+                        <li class="auth-hidden"><a href="#" data-page="login">Login</a></li>
+                        <li class="auth-hidden"><a href="#" data-page="register">Register</a></li>
+                        <li class="auth-required" style="display: none;"><a href="#" data-page="my-surveys">My Surveys</a></li>
+                        <li class="admin-required" style="display: none;"><a href="#" data-page="admin">Admin</a></li>
+                        <li class="auth-required" style="display: none;"><a href="#" id="logout-link">Logout</a></li>
+                    </ul>
+                </nav>
+                <div class="user-info auth-required" style="display: none;">
+                    <span id="username-display"></span>
+                </div>
+            </div>
+        </header>
+        
+        <!-- Main Content -->
+        <main>
+            <!-- Home Page -->
+            <section id="home-page" class="page active">
+                <div class="container">
+                    <div class="page-header">
+                        <h2>Available Surveys</h2>
+                    </div>
+                    <div id="surveys-list" class="surveys-list">
+                        <!-- Surveys will be loaded here -->
+                        <div class="loading">Loading surveys...</div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Login Page -->
+            <section id="login-page" class="page">
+                <div class="container">
+                    <div class="auth-form-container">
+                        <form id="login-form" class="auth-form">
+                            <h2>Login</h2>
+                            <div class="form-group">
+                                <label for="login-email">Email</label>
+                                <input type="email" id="login-email" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="login-password">Password</label>
+                                <input type="password" id="login-password" required>
+                            </div>
+                            <button type="submit" class="btn primary-btn">Login</button>
+                            <div id="login-error" class="error-message"></div>
+                            <div class="auth-link">
+                                Don't have an account? <a href="#" data-page="register">Register</a>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Register Page -->
+            <section id="register-page" class="page">
+                <div class="container">
+                    <div class="auth-form-container">
+                        <form id="register-form" class="auth-form">
+                            <h2>Register</h2>
+                            <div class="form-group">
+                                <label for="register-username">Username</label>
+                                <input type="text" id="register-username" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="register-email">Email</label>
+                                <input type="email" id="register-email" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="register-password">Password</label>
+                                <input type="password" id="register-password" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="register-confirm">Confirm Password</label>
+                                <input type="password" id="register-confirm" required>
+                            </div>
+                            <button type="submit" class="btn primary-btn">Register</button>
+                            <div id="register-error" class="error-message"></div>
+                            <div class="auth-link">
+                                Already have an account? <a href="#" data-page="login">Login</a>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Survey Page -->
+            <section id="survey-page" class="page">
+                <div class="container">
+                    <div class="page-header">
+                        <h2 id="survey-title">Survey Title</h2>
+                        <p id="survey-description" class="description">Survey description will appear here.</p>
+                    </div>
+                    <form id="survey-form" class="survey-form">
+                        <div id="questions-container">
+                            <!-- Questions will be loaded here -->
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="btn primary-btn">Submit</button>
+                        </div>
+                    </form>
+                    <div id="survey-success" class="success-message" style="display: none;">
+                        Thank you for completing the survey!
+                        <div class="mt-20">
+                            <a href="#" data-page="home" class="btn secondary-btn">Back to Surveys</a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- My Surveys Page -->
+            <section id="my-surveys-page" class="page auth-required">
+                <div class="container">
+                    <div class="page-header">
+                        <h2>My Survey Responses</h2>
+                    </div>
+                    <div id="my-surveys-list" class="surveys-list">
+                        <!-- User's survey responses will be loaded here -->
+                        <div class="loading">Loading your surveys...</div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Survey Results Page -->
+            <section id="results-page" class="page auth-required">
+                <div class="container">
+                    <div class="page-header">
+                        <h2 id="results-title">Survey Results</h2>
+                        <p id="results-description" class="description"></p>
+                        <div id="results-meta" class="results-meta">
+                            <span id="results-count">0 responses</span>
+                        </div>
+                    </div>
+<div id="results-meta" class="results-meta">
+                            <span id="results-count">0 responses</span>
+                        </div>
+                    </div>
+                    <div id="results-container" class="results-container">
+                        <!-- Results will be loaded here -->
+                    </div>
+                    <div class="form-actions">
+                        <a href="#" class="btn secondary-btn back-btn">Back</a>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Admin Page -->
+            <section id="admin-page" class="page admin-required">
+                <div class="container">
+                    <div class="page-header">
+                        <h2>Admin Dashboard</h2>
+                        <button id="create-survey-btn" class="btn primary-btn">Create New Survey</button>
+                    </div>
+                    <div id="admin-surveys-list" class="surveys-list">
+                        <!-- Admin surveys will be loaded here -->
+                        <div class="loading">Loading surveys...</div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Create/Edit Survey Page -->
+            <section id="edit-survey-page" class="page admin-required">
+                <div class="container">
+                    <div class="page-header">
+                        <h2 id="edit-survey-title">Create New Survey</h2>
+                    </div>
+                    <form id="edit-survey-form" class="survey-form">
+                        <div class="form-group">
+                            <label for="survey-title-input">Title</label>
+                            <input type="text" id="survey-title-input" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="survey-description-input">Description</label>
+                            <textarea id="survey-description-input" rows="3"></textarea>
+                        </div>
+                        <div id="edit-questions-container">
+                            <!-- Questions editor will be loaded here -->
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" id="add-question-btn" class="btn secondary-btn">
+                                <i class="fas fa-plus"></i> Add Question
+                            </button>
+                            <button type="submit" class="btn primary-btn">Save Survey</button>
+                        </div>
+                    </form>
+                </div>
+            </section>
+        </main>
+        
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="container">
+                <p>&copy; 2025 SurveyApp. All rights reserved.</p>
+            </div>
+        </footer>
+    </div>
+    
+    <!-- Question Template (hidden) -->
+    <template id="question-template">
+        <div class="question" data-type="text">
+            <div class="question-text">
+                <p class="question-label"></p>
+                <span class="required-badge">Required</span>
+            </div>
+            <div class="question-input">
+                <!-- Dynamic input based on question type -->
+            </div>
+        </div>
+    </template>
+    
+    <!-- Question Editor Template (hidden) -->
+    <template id="question-editor-template">
+        <div class="question-editor">
+            <div class="question-editor-header">
+                <h3>Question <span class="question-number"></span></h3>
+                <button type="button" class="btn icon-btn delete-question-btn">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+            <div class="form-group">
+                <label>Question Text</label>
+                <input type="text" class="question-text-input" placeholder="Enter your question" required>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Question Type</label>
+                    <select class="question-type-select">
+                        <option value="text">Short Text</option>
+                        <option value="textarea">Long Text</option>
+                        <option value="radio">Single Choice (Radio)</option>
+                        <option value="checkbox">Multiple Choice (Checkbox)</option>
+                        <option value="dropdown">Dropdown</option>
+                        <option value="scale">Scale (1-10)</option>
+                        <option value="date">Date</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Required</label>
+                    <div class="toggle-container">
+                        <input type="checkbox" class="toggle-input is-required-input">
+                        <label class="toggle-label"></label>
+                    </div>
+                </div>
+            </div>
+            <div class="options-container" style="display: none;">
+                <label>Options</label>
+                <div class="options-list">
+                    <!-- Options will be added here -->
+                </div>
+                <button type="button" class="btn secondary-btn add-option-btn">
+                    <i class="fas fa-plus"></i> Add Option
+                </button>
+            </div>
+        </div>
+    </template>
+    
+    <!-- Option Editor Template (hidden) -->
+    <template id="option-editor-template">
+        <div class="option-editor">
+            <input type="text" class="option-text-input" placeholder="Option text" required>
+            <button type="button" class="btn icon-btn delete-option-btn">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+    </template>
+    
+    <script src="js/app.js"></script>
+</body>
+</html>
+
+
+// styles.css
+
+:root {
+    --primary-color: #4a6df5;
+    --primary-dark: #3a5dd5;
+    --secondary-color: #6c757d;
+    --success-color: #28a745;
+    --danger-color: #dc3545;
+    --warning-color: #ffc107;
+    --info-color: #17a2b8;
+    --light-color: #f8f9fa;
+    --dark-color: #343a40;
+    --border-color: #dee2e6;
+    --text-color: #333;
+    --bg-color: #f5f7fb;
+    --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.05);
+    --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+    --radius-sm: 4px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Roboto', sans-serif;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    line-height: 1.6;
+}
+
+.container {
+    width: 100%;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 20px;
+}
+
+/* Header */
+.header {
+    background-color: white;
+    box-shadow: var(--shadow-sm);
+    padding: 1rem 0;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+
+.header .container {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+}
+
+.logo i {
+    font-size: 1.5rem;
+    color: var(--primary-color);
+    margin-right: 0.5rem;
+}
+
+.logo h1 {
+    font-size: 1.5rem;
+    font-weight: 500;
+    color: var(--dark-color);
+}
+
+.nav ul {
+    display: flex;
+    list-style: none;
+}
+
+.nav li {
+    margin-left: 1.5rem;
+}
+
+.nav a {
+    text-decoration: none;
+    color: var(--secondary-color);
+    font-weight: 500;
+    padding: 0.5rem 0;
+    transition: color 0.3s;
+}
+
+.nav a:hover, .nav a.active {
+    color: var(--primary-color);
+}
+
+.user-info {
+    font-weight: 500;
+    color: var(--dark-color);
+}
+
+/* Main content */
+main {
+    min-height: calc(100vh - 130px);
+    padding: 2rem 0;
+}
+
+.page {
+    display: none;
+}
+
+.page.active {
+    display: block;
+}
+
+.page-header {
+    margin-bottom: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+}
+
+.page-header h2 {
+    font-size: 1.75rem;
+    color: var(--dark-color);
+    margin-bottom: 0.5rem;
+}
+
+.description {
+    color: var(--secondary-color);
+    margin-bottom: 1.5rem;
+}
+
+/* Buttons */
+.btn {
+    display: inline-block;
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s;
+    text-decoration: none;
+}
+
+.primary-btn {
+    background-color: var(--primary-color);
+    color: white;
+}
+
+.primary-btn:hover {
+    background-color: var(--primary-dark);
+}
+
+.secondary-btn {
+    background-color: var(--secondary-color);
+    color: white;
+}
+
+.secondary-btn:hover {
+    background-color: #5a6268;
+}
+
+.icon-btn {
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background-color: transparent;
+    color: var(--secondary-color);
+}
+
+.icon-btn:hover {
+    background-color: var(--light-color);
+}
+
+.danger-btn {
+    background-color: var(--danger-color);
+    color: white;
+}
+
+.danger-btn:hover {
+    background-color: #c82333;
+}
+
+/* Forms */
+.form-group {
+    margin-bottom: 1.5rem;
+}
+
+.form-row {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.form-row .form-group {
+    flex: 1;
+    margin-bottom: 0;
+}
+
+label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 500;
+    color: var(--dark-color);
+}
+
+input, textarea, select {
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    font-size: 1rem;
+    transition: border-color 0.3s;
+}
+
+input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+.form-actions {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2rem;
+}
+
+/* Auth forms */
+.auth-form-container {
+    max-width: 500px;
+    margin: 0 auto;
+    padding: 2rem;
+    background-color: white;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+}
+
+.auth-form h2 {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.auth-link {
+    text-align: center;
+    margin-top: 1.5rem;
+    color: var(--secondary-color);
+}
+
+.auth-link a {
+    color: var(--primary-color);
+    text-decoration: none;
+}
+
+.error-message {
+    color: var(--danger-color);
+    margin-top: 1rem;
+}
+
+.success-message {
+    color: var(--success-color);
+    padding: 1rem;
+    background-color: rgba(40, 167, 69, 0.1);
+    border-radius: var(--radius-sm);
+    text-align: center;
+    margin-top: 1rem;
+}
+
+/* Survey list */
+.surveys-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 1.5rem;
+}
+
+.survey-card {
+    background-color: white;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
+    padding: 1.5rem;
+    transition: transform 0.3s, box-shadow 0.3s;
+}
+
+.survey-card:hover {
+    transform: translateY(-5px);
+    box-shadow: var(--shadow-md);
+}
+
+.survey-card h3 {
+    margin-bottom: 0.75rem;
+    color: var(--dark-color);
+}
+
+.survey-meta {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 1rem;
+    font-size: 0.875rem;
+    color: var(--secondary-color);
+}
+
+.survey-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 1.5rem;
+}
+
+/* Survey form */
+.survey-form {
+    background-color: white;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    padding: 2rem;
+}
+
+.question {
+    margin-bottom: 2rem;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.question:last-child {
+    border-bottom: none;
+}
+
+.question-text {
+    margin-bottom: 1rem;
+    display: flex;
+    align-items: flex-start;
+}
+
+.question-label {
+    font-weight: 500;
+    flex: 1;
+}
+
+.required-badge {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    background-color: var(--light-color);
+    color: var(--secondary-color);
+    border-radius: var(--radius-sm);
+    margin-left: 0.5rem;
+}
+
+.question[data-required="true"] .required-badge {
+    background-color: rgba(220, 53, 69, 0.1);
+    color: var(--danger-color);
+}
+
+.radio-option, .checkbox-option {
+    display: flex;
+    align-items: center;
+    margin-bottom: 0.75rem;
+}
+
+.radio-option input, .checkbox-option input {
+    width: auto;
+    margin-right: 0.5rem;
+}
+
+/* Question editor */
+.question-editor {
+    background-color: var(--light-color);
+    border-radius: var(--radius-md);
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.question-editor-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.question-editor-header h3 {
+    font-size: 1.25rem;
+    color: var(--dark-color);
+}
+
+.options-list {
+    margin-bottom: 1rem;
+}
+
+.option-editor {
+    display: flex;
+    align-items: center;
+    margin-bottom: 0.75rem;
+}
+
+.option-editor input {
+    flex: 1;
+    margin-right: 0.5rem;
+}
+
+/* Toggle switch */
+.toggle-container {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 24px;
+}
+
+.toggle-input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-label {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #ccc;
+    border-radius: 34px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+}
+
+.toggle-label:before {
+    position: absolute;
+    content: "";
+    height: 16px;
+    width: 16px;
+    left: 4px;
+    bottom: 4px;
+    background-color: white;
+    border-radius: 50%;
+    transition: transform 0.3s;
+}
+
+.toggle-input:checked + .toggle-label {
+    background-color: var(--primary-color);
+}
+
+.toggle-input:checked + .toggle-label:before {
+    transform: translateX(26px);
+}
+
+/* Results page */
+.results-meta {
+    margin-bottom: 1.5rem;
+    color: var(--secondary-color);
+}
+
+.results-container {
+    background-color: white;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    padding: 2rem;
+    margin-bottom: 2rem;
+}
+
+.result-item {
+    margin-bottom: 2.5rem;
+}
+
+.result-item h3 {
+    margin-bottom: 1rem;
+    color: var(--dark-color);
+}
+
+.chart-container {
+    height: 300px;
+    margin-bottom: 1.5rem;
+}
+
+.text-answers {
+    background-color: var(--light-color);
+    border-radius: var(--radius-sm);
+    padding: 1rem;
+}
+
+.text-answer {
+    padding: 0.75rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.text-answer:last-child {
+    border-bottom: none;
+}
+
+/* Utilities */
+.loading {
+    text-align: center;
+    padding: 2rem;
+    color: var(--secondary-color);
+}
+
+.mt-20 {
+    margin-top: 20px;
+}
+
+/* Footer */
+.footer {
+    background-color: white;
+    padding: 1.5rem 0;
+    text-align: center;
+    color: var(--secondary-color);
+    box-shadow: var(--shadow-sm);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .page-header {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    
+    .page-header button {
+        margin-top: 1rem;
+        align-self: flex-end;
+    }
+    
+    .form-row {
+        flex-direction: column;
+        gap: 0;
+    }
+    
+    .surveys-list {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+// app.js
+
+// Config
+const API_URL = 'http://localhost:3000/api';
+
+// DOM Elements
+const app = document.getElementById('app');
+const mainNav = document.getElementById('main-nav');
+const navLinks = document.querySelectorAll('#main-nav a');
+const logoutLink = document.getElementById('logout-link');
+const authRequiredElements = document.querySelectorAll('.auth-required');
+const authHiddenElements = document.querySelectorAll('.auth-hidden');
+const adminRequiredElements = document.querySelectorAll('.admin-required');
+const usernameDisplay = document.getElementById('username-display');
+
+// Pages
+const pages = document.querySelectorAll('.page');
+
+// Auth Forms
+const loginForm = document.getElementById('login-form');
+const registerForm = document.getElementById('register-form');
+const loginError = document.getElementById('login-error');
+const registerError = document.getElementById('register-error');
+
+// Survey Lists
+const surveysList = document.getElementById('surveys-list');
+const adminSurveysList = document.getElementById('admin-surveys-list');
+const mySurveysList = document.getElementById('my-surveys-list');
+
+// Survey Page
+const surveyForm = document.getElementById('survey-form');
+const surveyTitle = document.getElementById('survey-title');
+const surveyDescription = document.getElementById('survey-description');
+const questionsContainer = document.getElementById('questions-container');
+const surveySuccess = document.getElementById('survey-success');
+
+// Edit Survey Page
+const editSurveyForm = document.getElementById('edit-survey-form');
+const editSurveyTitle = document.getElementById('edit-survey-title');
+const surveyTitleInput = document.getElementById('survey-title-input');
+const surveyDescriptionInput = document.getElementById('survey-description-input');
+const editQuestionsContainer = document.getElementById('edit-questions-container');
+const addQuestionBtn = document.getElementById('add-question-btn');
+const createSurveyBtn = document.getElementById('create-survey-btn');
+
+// Results Page
+const resultsTitle = document.getElementById('results-title');
+const resultsDescription = document.getElementById('results-description');
+const resultsCount = document.getElementById('results-count');
+const resultsContainer = document.getElementById('results-container');
+
+// Templates
+const questionTemplate = document.getElementById('question-template');
+const questionEditorTemplate = document.getElementById('question-editor-template');
+const optionEditorTemplate = document.getElementById('option-editor-template');
+
+// App State
+let currentUser = null;
+let currentPage = 'home';
+let currentSurvey = null;
+let editingSurveyId = null;
+let questionEditors = [];
+
+// Event Listeners
+document.addEventListener('DOMContentLoaded', initApp);
+
+// Initialize App
+function initApp() {
+    // Navigation
+    navLinks.forEach(link => {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            const page = link.getAttribute('data-page');
+            if (page) {
+                navigateToPage(page);
+            }
+        });
+    });
+    
+    // Auth links in forms
+    document.querySelectorAll('.auth-link a').forEach(link => {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            const page = link.getAttribute('data-page');
+            if (page) {
+                navigateToPage(page);
+            }
+        });
+    });
+    
+    // Logout
+    logoutLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        logout();
+    });
+    
+    // Auth forms
+    loginForm.addEventListener('submit', handleLogin);
+    registerForm.addEventListener('submit', handleRegister);
+    
+    // Survey form
+    surveyForm.addEventListener('submit', handleSurveySubmit);
+    
+    // Edit survey form
+    editSurveyForm.addEventListener('submit', handleEditSurveySubmit);
+    addQuestionBtn.addEventListener('click', addQuestionEditor);
+    createSurveyBtn.addEventListener('click', () => {
+        editingSurveyId = null;
+        navigateToPage('edit-survey');
+        resetEditSurveyForm();
+    });
+    
+    // Back buttons
+    document.querySelectorAll('.back-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            window.history.back();
+        });
+    });
+    
+    // Check if user is already logged in
+    checkAuth();
+    
+    // Load surveys for home page
+    loadSurveys();
+    
+    // Handle URL changes
+    window.addEventListener('popstate', handleUrlChange);
+    handleUrlChange();
+}
+
+// Auth Functions
+
+function checkAuth() {
+    const token = localStorage.getItem('token');
+    const user = localStorage.getItem('user');
+    
+    if (token && user) {
+        try {
+            currentUser = JSON.parse(user);
+            updateAuthUI();
+        } catch (error) {
+            console.error('Error parsing user data:', error);
+            logout();
+        }
+    } else {
+        updateAuthUI();
+    }
+}
+
+function updateAuthUI() {
+    if (currentUser) {
+        // Show authenticated elements
+        authRequiredElements.forEach(el => el.style.display = 'block');
+        authHiddenElements.forEach(el => el.style.display = 'none');
+        
+        // Show admin elements if admin
+        if (currentUser.isAdmin) {
+            adminRequiredElements.forEach(el => el.style.display = 'block');
+        } else {
+            adminRequiredElements.forEach(el => el.style.display = 'none');
+        }
+        
+        // Update username display
+        usernameDisplay.textContent = currentUser.username;
+    } else {
+        // Hide authenticated elements
+        authRequiredElements.forEach(el => el.style.display = 'none');
+        authHiddenElements.forEach(el => el.style.display = 'block');
+        adminRequiredElements.forEach(el => el.style.display = 'none');
+    }
+}
+
+async function handleLogin(e) {
+    e.preventDefault();
+    
+    const email = document.getElementById('login-email').value;
+    const password = document.getElementById('login-password').value;
+    
+    try {
+        const response = await fetch(`${API_URL}/login`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ email, password })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+            loginError.textContent = data.error || 'Login failed';
+            return;
+        }
+        
+        // Save token and user info
+        localStorage.setItem('token', data.token);
+        localStorage.setItem('user', JSON.stringify(data.user));
+        
+        // Update current user
+        currentUser = data.user;
+        
+        // Update UI
+        updateAuthUI();
+        
+        // Navigate to home
+        navigateToPage('home');
+        
+    } catch (error) {
+        console.error('Login error:', error);
+        loginError.textContent = 'An unexpected error occurred';
+    }
+}
+
+async function handleRegister(e) {
+    e.preventDefault();
+    
+    const username = document.getElementById('register-username').value;
+    const email = document.getElementById('register-email').value;
+    const password = document.getElementById('register-password').value;
+    const confirmPassword = document.getElementById('register-confirm').value;
+    
+    // Validate password match
+    if (password !== confirmPassword) {
+        registerError.textContent = 'Passwords do not match';
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_URL}/register`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ username, email, password })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+            registerError.textContent = data.error || 'Registration failed';
+            return;
+        }
+        
+        // Show success and navigate to login
+        navigateToPage('login');
+        loginError.textContent = 'Registration successful! Please log in.';
+        loginError.style.color = 'var(--success-color)';
+        
+        // Auto-fill email
+        document.getElementById('login-email').value = email;
+        
+    } catch (error) {
+        console.error('Registration error:', error);
+        registerError.textContent = 'An unexpected error occurred';
+    }
+}
+
+function logout() {
+    // Clear storage and state
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    currentUser = null;
+    
+    // Update UI
+    updateAuthUI();
+    
+    // Navigate to home
+    navigateToPage('home');
+}
+
+// Navigation
+
+function navigateToPage(page, params = {}) {
+    // Update current page
+    currentPage = page;
+    
+    // Hide all pages
+    pages.forEach(p => p.classList.remove('active'));
+    
+    // Update active nav link
+    navLinks.forEach(link => {
+        if (link.getAttribute('data-page') === page) {
+            link.classList.add('active');
+        } else {
+            link.classList.remove('active');
+        }
+    });
+    
+    // Show selected page
+    const pageElement = document.getElementById(`${page}-page`);
+    if (pageElement) {
+        pageElement.classList.add('active');
+    }
+    
+    // Update browser URL
+    let url = `#${page}`;
+    if (params.id) {
+        url += `/${params.id}`;
+    }
+    history.pushState({ page, params }, '', url);
+    
+    // Page-specific logic
+    switch (page) {
+        case 'home':
+            loadSurveys();
+            break;
+        case 'admin':
+            if (currentUser?.isAdmin) {
+                loadAdminSurveys();
+            } else {
+                navigateToPage('home');
+            }
+            break;
+        case 'my-surveys':
+            if (currentUser) {
+                loadMySurveys();
+            } else {
+                navigateToPage('login');
+            }
+            break;
+        case 'survey':
+            if (params.id) {
+                loadSurvey(params.id);
+            } else {
+                navigateToPage('home');
+            }
+            break;
+        case 'results':
+            if (params.id && currentUser) {
+                loadSurveyResults(params.id);
+            } else {
+                navigateToPage('home');
+            }
+            break;
+        case 'edit-survey':
+            if (currentUser?.isAdmin) {
+                if (params.id) {
+                    loadSurveyForEditing(params.id);
+                } else {
+                    resetEditSurveyForm();
+                }
+            } else {
+                navigateToPage('home');
+            }
+            break;
+    }
+    
+    // Scroll to top
+    window.scrollTo(0, 0);
+}
+
+function handleUrlChange() {
+    const hash = window.location.hash.substring(1);
+    
+    if (!hash) {
+        navigateToPage('home');
+        return;
+    }
+    
+    const [page, id] = hash.split('/');
+    
+    if (page && pageExists(page)) {
+        navigateToPage(page, { id });
+    } else {
+        navigateToPage('home');
+    }
+}
+
+function pageExists(page) {
+    return document.getElementById(`${page}-page`) !== null;
+}
+
+// Survey Functions
+
+async function loadSurveys() {
+    surveysList.innerHTML = '<div class="loading">Loading surveys...</div>';
+    
+    try {
+        const response = await fetch(`${API_URL}/surveys`);
+        
+        if (!response.ok) {
+            throw new Error('Failed to fetch surveys');
+        }
+        
+        const surveys = await response.json();
+        
+        if (surveys.length === 0) {
+            surveysList.innerHTML = '<p>No surveys available.</p>';
+            return;
+        }
+        
+        // Render surveys
+        surveysList.innerHTML = '';
+        surveys.forEach(survey => {
+            const card = createSurveyCard(survey);
+            surveysList.appendChild(card);
+        });
+        
+    } catch (error) {
+        console.error('Load surveys error:', error);
+        surveysList.innerHTML = '<p>Error loading// DATABASE SCHEMA (MySQL)
+
+-- Database Creation
+CREATE DATABASE IF NOT EXISTS survey_app;
+USE survey_app;
+
+-- Users Table
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    is_admin BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP NULL
+);
+
+-- Surveys Table
+CREATE TABLE surveys (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    created_by INT NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    end_date TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Questions Table
+CREATE TABLE questions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    survey_id INT NOT NULL,
+    question_text TEXT NOT NULL,
+    question_type ENUM('text', 'textarea', 'radio', 'checkbox', 'dropdown', 'scale', 'date') NOT NULL,
+    is_required BOOLEAN DEFAULT FALSE,
+    position INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (survey_id) REFERENCES surveys(id) ON DELETE CASCADE
+);
+
+-- Options Table (for multiple choice questions)
+CREATE TABLE options (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    question_id INT NOT NULL,
+    option_text VARCHAR(255) NOT NULL,
+    position INT NOT NULL,
+    FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+);
+
+-- Responses Table (metadata about a user's response to a survey)
+CREATE TABLE responses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    survey_id INT NOT NULL,
+    user_id INT NULL, -- NULL for anonymous responses
+    ip_address VARCHAR(45) NULL,
+    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (survey_id) REFERENCES surveys(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- Answers Table (individual question answers)
+CREATE TABLE answers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    response_id INT NOT NULL,
+    question_id INT NOT NULL,
+    answer_text TEXT NULL,
+    FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE,
+    FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+);
+
+-- Selected Options Table (for multiple choice answers)
+CREATE TABLE selected_options (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    answer_id INT NOT NULL,
+    option_id INT NOT NULL,
+    FOREIGN KEY (answer_id) REFERENCES answers(id) ON DELETE CASCADE,
+    FOREIGN KEY (option_id) REFERENCES options(id) ON DELETE CASCADE
+);
+
+
+// BACKEND IMPLEMENTATION (Node.js with Express)
+
+// app.js - Main server file
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+const dotenv = require('dotenv');
+
+// Load environment variables
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Database connection
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'survey_app',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Access denied' });
+    
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+};
+
+// Admin middleware
+const isAdmin = async (req, res, next) => {
+    try {
+        const connection = await pool.getConnection();
+        const [rows] = await connection.query(
+            'SELECT is_admin FROM users WHERE id = ?',
+            [req.user.id]
+        );
+        connection.release();
+        
+        if (rows.length === 0 || !rows[0].is_admin) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+        
+        next();
+    } catch (error) {
+        console.error('Admin check error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// ROUTES
+
+// Authentication Routes
+app.post('/api/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        
+        // Validate input
+        if (!username || !email || !password) {
+            return res.status(400).json({ error: 'All fields are required' });
+        }
+        
+        // Hash password
+        const saltRounds = 10;
+        const hashedPassword = await bcrypt.hash(password, saltRounds);
+        
+        const connection = await pool.getConnection();
+        
+        // Check if user already exists
+        const [existingUsers] = await connection.query(
+            'SELECT * FROM users WHERE username = ? OR email = ?',
+            [username, email]
+        );
+        
+        if (existingUsers.length > 0) {
+            connection.release();
+            return res.status(409).json({ error: 'Username or email already exists' });
+        }
+        
+        // Insert new user
+        const [result] = await connection.query(
+            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+            [username, email, hashedPassword]
+        );
+        
+        connection.release();
+        
+        res.status(201).json({ 
+            message: 'User registered successfully',
+            userId: result.insertId
+        });
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        // Validate input
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        // Find user
+        const [users] = await connection.query(
+            'SELECT * FROM users WHERE email = ?',
+            [email]
+        );
+        
+        if (users.length === 0) {
+            connection.release();
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const user = users[0];
+        
+        // Compare password
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        if (!validPassword) {
+            connection.release();
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        // Update last login
+        await connection.query(
+            'UPDATE users SET last_login = NOW() WHERE id = ?',
+            [user.id]
+        );
+        
+        connection.release();
+        
+        // Generate token
+        const token = jwt.sign(
+            { id: user.id, username: user.username, isAdmin: user.is_admin },
+            process.env.JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+        
+        res.status(200).json({
+            message: 'Login successful',
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                isAdmin: user.is_admin
+            }
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Survey Routes
+
+// Get all surveys (public)
+app.get('/api/surveys', async (req, res) => {
+    try {
+        const connection = await pool.getConnection();
+        
+        const [surveys] = await connection.query(
+            `SELECT s.id, s.title, s.description, s.is_active, 
+             s.start_date, s.end_date, u.username as created_by_username,
+             (SELECT COUNT(*) FROM questions WHERE survey_id = s.id) as question_count
+             FROM surveys s
+             JOIN users u ON s.created_by = u.id
+             WHERE s.is_active = 1
+             ORDER BY s.created_at DESC`
+        );
+        
+        connection.release();
+        
+        res.status(200).json(surveys);
+    } catch (error) {
+        console.error('Fetch surveys error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get survey by ID (with questions and options)
+app.get('/api/surveys/:id', async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const connection = await pool.getConnection();
+        
+        // Get survey
+        const [surveys] = await connection.query(
+            `SELECT s.*, u.username as created_by_username
+             FROM surveys s
+             JOIN users u ON s.created_by = u.id
+             WHERE s.id = ?`,
+            [surveyId]
+        );
+        
+        if (surveys.length === 0) {
+            connection.release();
+            return res.status(404).json({ error: 'Survey not found' });
+        }
+        
+        const survey = surveys[0];
+        
+        // Get questions
+        const [questions] = await connection.query(
+            `SELECT * FROM questions
+             WHERE survey_id = ?
+             ORDER BY position ASC`,
+            [surveyId]
+        );
+        
+        // Get options for all questions
+        const [options] = await connection.query(
+            `SELECT o.* FROM options o
+             JOIN questions q ON o.question_id = q.id
+             WHERE q.survey_id = ?
+             ORDER BY o.position ASC`,
+            [surveyId]
+        );
+        
+        // Map options to questions
+        const questionsWithOptions = questions.map(question => {
+            const questionOptions = options.filter(option => option.question_id === question.id);
+            return {
+                ...question,
+                options: questionOptions
+            };
+        });
+        
+        survey.questions = questionsWithOptions;
+        
+        connection.release();
+        
+        res.status(200).json(survey);
+    } catch (error) {
+        console.error('Fetch survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Submit survey response
+app.post('/api/surveys/:id/respond', async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const { answers } = req.body;
+        const userId = req.headers.authorization ? jwt.decode(req.headers.authorization.split(' ')[1])?.id : null;
+        const ipAddress = req.ip;
+        
+        const connection = await pool.getConnection();
+        
+        // Start transaction
+        await connection.beginTransaction();
+        
+        try {
+            // Create response
+            const [responseResult] = await connection.query(
+                'INSERT INTO responses (survey_id, user_id, ip_address) VALUES (?, ?, ?)',
+                [surveyId, userId, ipAddress]
+            );
+            
+            const responseId = responseResult.insertId;
+            
+            // Insert answers
+            for (const answer of answers) {
+                const { questionId, answerText, selectedOptions } = answer;
+                
+                // Insert answer text
+                const [answerResult] = await connection.query(
+                    'INSERT INTO answers (response_id, question_id, answer_text) VALUES (?, ?, ?)',
+                    [responseId, questionId, answerText || null]
+                );
+                
+                const answerId = answerResult.insertId;
+                
+                // Insert selected options if any
+                if (selectedOptions && selectedOptions.length > 0) {
+                    for (const optionId of selectedOptions) {
+                        await connection.query(
+                            'INSERT INTO selected_options (answer_id, option_id) VALUES (?, ?)',
+                            [answerId, optionId]
+                        );
+                    }
+                }
+            }
+            
+            // Commit transaction
+            await connection.commit();
+            
+            connection.release();
+            
+            res.status(201).json({
+                message: 'Survey response submitted successfully',
+                responseId
+            });
+        } catch (error) {
+            // Rollback transaction on error
+            await connection.rollback();
+            connection.release();
+            throw error;
+        }
+    } catch (error) {
+        console.error('Submit response error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Admin Routes (protected)
+
+// Create a new survey
+app.post('/api/admin/surveys', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const { title, description, questions } = req.body;
+        const userId = req.user.id;
+        
+        if (!title) {
+            return res.status(400).json({ error: 'Survey title is required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        // Start transaction
+        await connection.beginTransaction();
+        
+        try {
+            // Create survey
+            const [surveyResult] = await connection.query(
+                'INSERT INTO surveys (title, description, created_by) VALUES (?, ?, ?)',
+                [title, description || null, userId]
+            );
+            
+            const surveyId = surveyResult.insertId;
+            
+            // Add questions
+            if (questions && questions.length > 0) {
+                for (let i = 0; i < questions.length; i++) {
+                    const q = questions[i];
+                    
+                    const [questionResult] = await connection.query(
+                        `INSERT INTO questions 
+                         (survey_id, question_text, question_type, is_required, position)
+                         VALUES (?, ?, ?, ?, ?)`,
+                        [surveyId, q.questionText, q.questionType, q.isRequired || false, i + 1]
+                    );
+                    
+                    const questionId = questionResult.insertId;
+                    
+                    // Add options for multiple choice questions
+                    if (['radio', 'checkbox', 'dropdown'].includes(q.questionType) && q.options && q.options.length > 0) {
+                        for (let j = 0; j < q.options.length; j++) {
+                            await connection.query(
+                                'INSERT INTO options (question_id, option_text, position) VALUES (?, ?, ?)',
+                                [questionId, q.options[j], j + 1]
+                            );
+                        }
+                    }
+                }
+            }
+            
+            // Commit transaction
+            await connection.commit();
+            
+            connection.release();
+            
+            res.status(201).json({
+                message: 'Survey created successfully',
+                surveyId
+            });
+        } catch (error) {
+            // Rollback transaction on error
+            await connection.rollback();
+            connection.release();
+            throw error;
+        }
+    } catch (error) {
+        console.error('Create survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update a survey
+app.put('/api/admin/surveys/:id', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const { title, description, questions, isActive, endDate } = req.body;
+        
+        const connection = await pool.getConnection();
+        
+        // Start transaction
+        await connection.beginTransaction();
+        
+        try {
+            // Update survey
+            await connection.query(
+                'UPDATE surveys SET title = ?, description = ?, is_active = ?, end_date = ? WHERE id = ?',
+                [title, description || null, isActive, endDate || null, surveyId]
+            );
+            
+            if (questions) {
+                // Delete existing questions and options
+                await connection.query('DELETE FROM questions WHERE survey_id = ?', [surveyId]);
+                
+                // Add updated questions
+                for (let i = 0; i < questions.length; i++) {
+                    const q = questions[i];
+                    
+                    const [questionResult] = await connection.query(
+                        `INSERT INTO questions 
+                         (survey_id, question_text, question_type, is_required, position)
+                         VALUES (?, ?, ?, ?, ?)`,
+                        [surveyId, q.questionText, q.questionType, q.isRequired || false, i + 1]
+                    );
+                    
+                    const questionId = questionResult.insertId;
+                    
+                    // Add options for multiple choice questions
+                    if (['radio', 'checkbox', 'dropdown'].includes(q.questionType) && q.options && q.options.length > 0) {
+                        for (let j = 0; j < q.options.length; j++) {
+                            await connection.query(
+                                'INSERT INTO options (question_id, option_text, position) VALUES (?, ?, ?)',
+                                [questionId, q.options[j], j + 1]
+                            );
+                        }
+                    }
+                }
+            }
+            
+            // Commit transaction
+            await connection.commit();
+            
+            connection.release();
+            
+            res.status(200).json({
+                message: 'Survey updated successfully'
+            });
+        } catch (error) {
+            // Rollback transaction on error
+            await connection.rollback();
+            connection.release();
+            throw error;
+        }
+    } catch (error) {
+        console.error('Update survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete a survey
+app.delete('/api/admin/surveys/:id', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        
+        const connection = await pool.getConnection();
+        await connection.query('DELETE FROM surveys WHERE id = ?', [surveyId]);
+        connection.release();
+        
+        res.status(200).json({
+            message: 'Survey deleted successfully'
+        });
+    } catch (error) {
+        console.error('Delete survey error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get survey results
+app.get('/api/admin/surveys/:id/results', authenticateToken, async (req, res) => {
+    try {
+        const surveyId = req.params.id;
+        const userId = req.user.id;
+        
+        const connection = await pool.getConnection();
+        
+        // Check if user is admin or survey creator
+        const [surveys] = await connection.query(
+            'SELECT created_by FROM surveys WHERE id = ?',
+            [surveyId]
+        );
+        
+        if (surveys.length === 0) {
+            connection.release();
+            return res.status(404).json({ error: 'Survey not found' });
+        }
+        
+        const [users] = await connection.query(
+            'SELECT is_admin FROM users WHERE id = ?',
+            [userId]
+        );
+        
+        if (surveys[0].created_by !== userId && !users[0].is_admin) {
+            connection.release();
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        
+        // Get survey and questions
+        const [surveyInfo] = await connection.query(
+            'SELECT title, description FROM surveys WHERE id = ?',
+            [surveyId]
+        );
+        
+        // Get questions
+        const [questions] = await connection.query(
+            'SELECT id, question_text, question_type FROM questions WHERE survey_id = ? ORDER BY position',
+            [surveyId]
+        );
+        
+        // Get response count
+        const [responseCount] = await connection.query(
+            'SELECT COUNT(*) as count FROM responses WHERE survey_id = ?',
+            [surveyId]
+        );
+        
+        // Process each question to get answer stats
+        const questionsWithStats = await Promise.all(questions.map(async (question) => {
+            const questionStats = { ...question };
+            
+            if (['radio', 'checkbox', 'dropdown'].includes(question.question_type)) {
+                // For multiple choice questions, get option stats
+                const [options] = await connection.query(
+                    `SELECT o.id, o.option_text, COUNT(so.id) as selection_count
+                     FROM options o
+                     LEFT JOIN selected_options so ON o.id = so.option_id
+                     LEFT JOIN answers a ON so.answer_id = a.id 
+                     LEFT JOIN responses r ON a.response_id = r.id AND r.survey_id = ?
+                     WHERE o.question_id = ?
+                     GROUP BY o.id
+                     ORDER BY o.position`,
+                    [surveyId, question.id]
+                );
+                
+                questionStats.options = options;
+            } else {
+                // For text questions, get sample answers
+                const [textAnswers] = await connection.query(
+                    `SELECT a.answer_text
+                     FROM answers a
+                     JOIN responses r ON a.response_id = r.id
+                     WHERE a.question_id = ? AND r.survey_id = ?
+                     ORDER BY r.submitted_at DESC
+                     LIMIT 10`,
+                    [question.id, surveyId]
+                );
+                
+                questionStats.sampleAnswers = textAnswers.map(a => a.answer_text);
+            }
+            
+            return questionStats;
+        }));
+        
+        const results = {
+            surveyInfo: surveyInfo[0],
+            responseCount: responseCount[0].count,
+            questions: questionsWithStats
+        };
+        
+        connection.release();
+        
+        res.status(200).json(results);
+    } catch (error) {
+        console.error('Fetch results error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get all surveys for admin
+app.get('/api/admin/surveys', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const connection = await pool.getConnection();
+        
+        const [surveys] = await connection.query(
+            `SELECT s.id, s.title, s.description, s.is_active, 
+             s.start_date, s.end_date, s.created_at, 
+             u.username as created_by_username,
+             (SELECT COUNT(*) FROM questions WHERE survey_id = s.id) as question_count,
+             (SELECT COUNT(*) FROM responses WHERE survey_id = s.id) as response_count
+             FROM surveys s
+             JOIN users u ON s.created_by = u.id
+             ORDER BY s.created_at DESC`
+        );
+        
+        connection.release();
+        
+        res.status(200).json(surveys);
+    } catch (error) {
+        console.error('Fetch admin surveys error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Serve the frontend app
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+module.exports = app;
+
+
+// FRONTEND IMPLEMENTATION (HTML, CSS, JavaScript)
+
+// index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Survey Application</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="container">
+                <div class="logo">
+                    <i class="fas fa-poll"></i>
+                    <h1>SurveyApp</h1>
+                </div>
+                <nav class="nav">
+                    <ul id="main-nav">
+                        <li><a href="#" data-page="home" class="active">Home</a></li>
+                        <li class="auth-hidden"><a href="#" data-page="login">Login</a></li>
+                        <li class="auth-hidden"><a href="#" data-page="register">Register</a></li>
+                        <li class="auth-required" style="display: none;"><a href="#" data-page="my-surveys">My Surveys</a></li>
+                        <li class="admin-required" style="display: none;"><a href="#" data-page="admin">Admin</a></li>
+                        <li class="auth-required" style="display: none;"><a href="#" id="logout-link">Logout</a></li>
+                    </ul>
+                </nav>
+                <div class="user-info auth-required" style="display: none;">
+                    <span id="username-display"></span>
+                </div>
+            </div>
+        </header>
+        
+        <!-- Main Content -->
+        <main>
+            <!-- Home Page -->
+            <section id="home-page" class="page active">
+                <div class="container">
+                    <div class="page-header">
+                        <h2>Available Surveys</h2>
+                    </div>
+                    <div id="surveys-list" class="surveys-list">
+                        <!-- Surveys will be loaded here -->
+                        <div class="loading">Loading surveys...</div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Login Page -->
+            <section id="login-page" class="page">
+                <div class="container">
+                    <div class="auth-form-container">
+                        <form id="login-form" class="auth-form">
+                            <h2>Login</h2>
+                            <div class="form-group">
+                                <label for="login-email">Email</label>
+                                <input type="email" id="login-email" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="login-password">Password</label>
+                                <input type="password" id="login-password" required>
+                            </div>
+                            <button type="submit" class="btn primary-btn">Login</button>
+                            <div id="login-error" class="error-message"></div>
+                            <div class="auth-link">
+                                Don't have an account? <a href="#" data-page="register">Register</a>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Register Page -->
+            <section id="register-page" class="page">
+                <div class="container">
+                    <div class="auth-form-container">
+                        <form id="register-form" class="auth-form">
+                            <h2>Register</h2>
+                            <div class="form-group">
+                                <label for="register-username">Username</label>
+                                <input type="text" id="register-username" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="register-email">Email</label>
+                                <input type="email" id="register-email" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="register-password">Password</label>
+                                <input type="password" id="register-password" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="register-confirm">Confirm Password</label>
+                                <input type="password" id="register-confirm" required>
+                            </div>
+                            <button type="submit" class="btn primary-btn">Register</button>
+                            <div id="register-error" class="error-message"></div>
+                            <div class="auth-link">
+                                Already have an account? <a href="#" data-page="login">Login</a>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Survey Page -->
+            <section id="survey-page" class="page">
+                <div class="container">
+                    <div class="page-header">
+                        <h2 id="survey-title">Survey Title</h2>
+                        <p id="survey-description" class="description">Survey description will appear here.</p>
+                    </div>
+                    <form id="survey-form" class="survey-form">
+                        <div id="questions-container">
+                            <!-- Questions will be loaded here -->
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="btn primary-btn">Submit</button>
+                        </div>
+                    </form>
+                    <div id="survey-success" class="success-message" style="display: none;">
+                        Thank you for completing the survey!
+                        <div class="mt-20">
+                            <a href="#" data-page="home" class="btn secondary-btn">Back to Surveys</a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- My Surveys Page -->
+            <section id="my-surveys-page" class="page auth-required">
+                <div class="container">
+                    <div class="page-header">
+                        <h2>My Survey Responses</h2>
+                    </div>
+                    <div id="my-surveys-list" class="surveys-list">
+                        <!-- User's survey responses will be loaded here -->
+                        <div class="loading">Loading your surveys...</div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Survey Results Page -->
+            <section id="results-page" class="page auth-required">
+                <div class="container">
+                    <div class="page-header">
+                        <h2 id="results-title">Survey Results</h2>
+                        <p id="results-description" class="description"></p>
+                        <div id="results-meta" class="results-meta">
+                            <span id="results-count">0 responses</span>
+                        </div>
+                    </div>
+                    <div id="results

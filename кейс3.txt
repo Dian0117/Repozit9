@@ -1,0 +1,1680 @@
+// DATABASE DESIGN (SQL - MySQL)
+// Create database schema
+
+-- Users Table
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP
+);
+
+-- Tasks Table
+CREATE TABLE tasks (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    title VARCHAR(100) NOT NULL,
+    description TEXT,
+    status ENUM('pending', 'in_progress', 'completed', 'archived') DEFAULT 'pending',
+    priority ENUM('low', 'medium', 'high') DEFAULT 'medium',
+    due_date DATETIME,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Tags Table
+CREATE TABLE tags (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    user_id INT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE (name, user_id)
+);
+
+-- Task Tags (Many-to-Many relationship)
+CREATE TABLE task_tags (
+    task_id INT NOT NULL,
+    tag_id INT NOT NULL,
+    PRIMARY KEY (task_id, tag_id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+);
+
+
+// BACKEND IMPLEMENTATION (Node.js with Express)
+// app.js - Main server file
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const dotenv = require('dotenv');
+
+// Load environment variables
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.static('public'));
+
+// Database connection
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'task_manager',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Access denied' });
+    
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+};
+
+// USER ROUTES
+
+// Register new user
+app.post('/api/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        
+        // Validate input
+        if (!username || !email || !password) {
+            return res.status(400).json({ error: 'All fields are required' });
+        }
+        
+        // Hash password
+        const saltRounds = 10;
+        const hashedPassword = await bcrypt.hash(password, saltRounds);
+        
+        // Check if user already exists
+        const connection = await pool.getConnection();
+        const [existingUsers] = await connection.query(
+            'SELECT * FROM users WHERE username = ? OR email = ?',
+            [username, email]
+        );
+        
+        if (existingUsers.length > 0) {
+            connection.release();
+            return res.status(409).json({ error: 'Username or email already exists' });
+        }
+        
+        // Insert new user
+        await connection.query(
+            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+            [username, email, hashedPassword]
+        );
+        
+        connection.release();
+        res.status(201).json({ message: 'User registered successfully' });
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        // Validate input
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required' });
+        }
+        
+        // Get user from database
+        const connection = await pool.getConnection();
+        const [users] = await connection.query(
+            'SELECT * FROM users WHERE email = ?',
+            [email]
+        );
+        
+        if (users.length === 0) {
+            connection.release();
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const user = users[0];
+        
+        // Compare password
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        if (!validPassword) {
+            connection.release();
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        // Update last login
+        await connection.query('UPDATE users SET last_login = NOW() WHERE id = ?', [user.id]);
+        connection.release();
+        
+        // Generate JWT token
+        const token = jwt.sign(
+            { id: user.id, username: user.username },
+            process.env.JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+        
+        res.status(200).json({
+            message: 'Login successful',
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email
+            }
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// TASK ROUTES
+
+// Get all tasks for authenticated user
+app.get('/api/tasks', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const connection = await pool.getConnection();
+        
+        const [tasks] = await connection.query(
+            `SELECT t.*, GROUP_CONCAT(tag.name) as tags
+             FROM tasks t
+             LEFT JOIN task_tags tt ON t.id = tt.task_id
+             LEFT JOIN tags tag ON tt.tag_id = tag.id
+             WHERE t.user_id = ?
+             GROUP BY t.id
+             ORDER BY t.due_date ASC`,
+            [userId]
+        );
+        
+        connection.release();
+        
+        // Format tags as arrays
+        const formattedTasks = tasks.map(task => ({
+            ...task,
+            tags: task.tags ? task.tags.split(',') : []
+        }));
+        
+        res.status(200).json(formattedTasks);
+    } catch (error) {
+        console.error('Error fetching tasks:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Create new task
+app.post('/api/tasks', authenticateToken, async (req, res) => {
+    try {
+        const { title, description, status, priority, due_date, tags } = req.body;
+        const userId = req.user.id;
+        
+        // Validate input
+        if (!title) {
+            return res.status(400).json({ error: 'Title is required' });
+        }
+        
+        const connection = await pool.getConnection();
+        
+        // Insert task
+        const [result] = await connection.query(
+            'INSERT INTO tasks (user_id, title, description, status, priority, due_date) VALUES (?, ?, ?, ?, ?, ?)',
+            [userId, title, description, status || 'pending', priority || 'medium', due_date]
+        );
+        
+        const taskId = result.insertId;
+        
+        // Process tags if provided
+        if (tags && tags.length > 0) {
+            for (const tagName of tags) {
+                // Find or create tag
+                let tagId;
+                const [existingTags] = await connection.query(
+                    'SELECT id FROM tags WHERE name = ? AND user_id = ?',
+                    [tagName, userId]
+                );
+                
+                if (existingTags.length > 0) {
+                    tagId = existingTags[0].id;
+                } else {
+                    const [newTag] = await connection.query(
+                        'INSERT INTO tags (name, user_id) VALUES (?, ?)',
+                        [tagName, userId]
+                    );
+                    tagId = newTag.insertId;
+                }
+                
+                // Associate tag with task
+                await connection.query(
+                    'INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)',
+                    [taskId, tagId]
+                );
+            }
+        }
+        
+        connection.release();
+        
+        res.status(201).json({
+            id: taskId,
+            message: 'Task created successfully'
+        });
+    } catch (error) {
+        console.error('Error creating task:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update task
+app.put('/api/tasks/:id', authenticateToken, async (req, res) => {
+    try {
+        const taskId = req.params.id;
+        const userId = req.user.id;
+        const { title, description, status, priority, due_date, tags } = req.body;
+        
+        const connection = await pool.getConnection();
+        
+        // Check if task exists and belongs to user
+        const [tasks] = await connection.query(
+            'SELECT * FROM tasks WHERE id = ? AND user_id = ?',
+            [taskId, userId]
+        );
+        
+        if (tasks.length === 0) {
+            connection.release();
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        
+        // Update task
+        await connection.query(
+            'UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, due_date = ? WHERE id = ?',
+            [title, description, status, priority, due_date, taskId]
+        );
+        
+        // Update tags if provided
+        if (tags) {
+            // Remove existing tag associations
+            await connection.query('DELETE FROM task_tags WHERE task_id = ?', [taskId]);
+            
+            // Add new tag associations
+            for (const tagName of tags) {
+                // Find or create tag
+                let tagId;
+                const [existingTags] = await connection.query(
+                    'SELECT id FROM tags WHERE name = ? AND user_id = ?',
+                    [tagName, userId]
+                );
+                
+                if (existingTags.length > 0) {
+                    tagId = existingTags[0].id;
+                } else {
+                    const [newTag] = await connection.query(
+                        'INSERT INTO tags (name, user_id) VALUES (?, ?)',
+                        [tagName, userId]
+                    );
+                    tagId = newTag.insertId;
+                }
+                
+                // Associate tag with task
+                await connection.query(
+                    'INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)',
+                    [taskId, tagId]
+                );
+            }
+        }
+        
+        connection.release();
+        
+        res.status(200).json({ message: 'Task updated successfully' });
+    } catch (error) {
+        console.error('Error updating task:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete task
+app.delete('/api/tasks/:id', authenticateToken, async (req, res) => {
+    try {
+        const taskId = req.params.id;
+        const userId = req.user.id;
+        
+        const connection = await pool.getConnection();
+        
+        // Check if task exists and belongs to user
+        const [tasks] = await connection.query(
+            'SELECT * FROM tasks WHERE id = ? AND user_id = ?',
+            [taskId, userId]
+        );
+        
+        if (tasks.length === 0) {
+            connection.release();
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        
+        // Delete task (cascading will handle task_tags)
+        await connection.query('DELETE FROM tasks WHERE id = ?', [taskId]);
+        
+        connection.release();
+        
+        res.status(200).json({ message: 'Task deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting task:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+module.exports = app;
+
+
+// FRONTEND IMPLEMENTATION
+// index.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task Manager</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Authentication Forms -->
+        <div id="auth-container">
+            <div class="auth-box">
+                <div class="tabs">
+                    <div class="tab active" data-tab="login">Login</div>
+                    <div class="tab" data-tab="register">Register</div>
+                </div>
+                <div class="tab-content">
+                    <!-- Login Form -->
+                    <form id="login-form" class="active">
+                        <h2>Welcome Back</h2>
+                        <div class="input-group">
+                            <label for="login-email">Email</label>
+                            <input type="email" id="login-email" required>
+                        </div>
+                        <div class="input-group">
+                            <label for="login-password">Password</label>
+                            <input type="password" id="login-password" required>
+                        </div>
+                        <button type="submit" class="btn primary-btn">Login</button>
+                        <div id="login-error" class="error-message"></div>
+                    </form>
+                    
+                    <!-- Register Form -->
+                    <form id="register-form">
+                        <h2>Create Account</h2>
+                        <div class="input-group">
+                            <label for="register-username">Username</label>
+                            <input type="text" id="register-username" required>
+                        </div>
+                        <div class="input-group">
+                            <label for="register-email">Email</label>
+                            <input type="email" id="register-email" required>
+                        </div>
+                        <div class="input-group">
+                            <label for="register-password">Password</label>
+                            <input type="password" id="register-password" required>
+                        </div>
+                        <div class="input-group">
+                            <label for="register-confirm-password">Confirm Password</label>
+                            <input type="password" id="register-confirm-password" required>
+                        </div>
+                        <button type="submit" class="btn primary-btn">Register</button>
+                        <div id="register-error" class="error-message"></div>
+                    </form>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Main Application (Hidden initially) -->
+        <div id="app-container" class="hidden">
+            <header>
+                <div class="logo">
+                    <i class="fas fa-check-circle"></i>
+                    <h1>Task Manager</h1>
+                </div>
+                <div class="user-info">
+                    <span id="username-display"></span>
+                    <button id="logout-btn" class="btn secondary-btn">Logout</button>
+                </div>
+            </header>
+            
+            <main>
+                <div class="sidebar">
+                    <div class="filters">
+                        <h3>Filters</h3>
+                        <ul>
+                            <li data-filter="all" class="active">All Tasks</li>
+                            <li data-filter="pending">Pending</li>
+                            <li data-filter="in_progress">In Progress</li>
+                            <li data-filter="completed">Completed</li>
+                        </ul>
+                    </div>
+                    <div class="tags-container">
+                        <h3>Tags</h3>
+                        <ul id="tags-list"></ul>
+                    </div>
+                </div>
+                
+                <div class="tasks-container">
+                    <div class="tasks-header">
+                        <h2>My Tasks</h2>
+                        <button id="new-task-btn" class="btn primary-btn">
+                            <i class="fas fa-plus"></i> New Task
+                        </button>
+                    </div>
+                    
+                    <!-- Tasks List -->
+                    <div id="tasks-list" class="tasks-list"></div>
+                    
+                    <!-- Empty State -->
+                    <div id="empty-state" class="hidden">
+                        <div class="empty-illustration">
+                            <i class="fas fa-clipboard-list"></i>
+                        </div>
+                        <h3>No tasks found</h3>
+                        <p>Create a new task to get started</p>
+                    </div>
+                </div>
+            </main>
+            
+            <!-- Task Modal -->
+            <div id="task-modal" class="modal hidden">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h2 id="modal-title">New Task</h2>
+                        <span class="close-modal">&times;</span>
+                    </div>
+                    <form id="task-form">
+                        <input type="hidden" id="task-id">
+                        <div class="input-group">
+                            <label for="task-title">Title</label>
+                            <input type="text" id="task-title" required>
+                        </div>
+                        <div class="input-group">
+                            <label for="task-description">Description</label>
+                            <textarea id="task-description" rows="3"></textarea>
+                        </div>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label for="task-status">Status</label>
+                                <select id="task-status">
+                                    <option value="pending">Pending</option>
+                                    <option value="in_progress">In Progress</option>
+                                    <option value="completed">Completed</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="task-priority">Priority</label>
+                                <select id="task-priority">
+                                    <option value="low">Low</option>
+                                    <option value="medium">Medium</option>
+                                    <option value="high">High</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="input-group">
+                            <label for="task-due-date">Due Date</label>
+                            <input type="datetime-local" id="task-due-date">
+                        </div>
+                        <div class="input-group">
+                            <label for="task-tags">Tags (comma separated)</label>
+                            <input type="text" id="task-tags" placeholder="work, personal, urgent">
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" id="delete-task-btn" class="btn danger-btn hidden">Delete</button>
+                            <button type="submit" id="save-task-btn" class="btn primary-btn">Save</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            
+            <!-- Delete Confirmation Modal -->
+            <div id="delete-modal" class="modal hidden">
+                <div class="modal-content delete-confirm">
+                    <h3>Delete Task</h3>
+                    <p>Are you sure you want to delete this task? This action cannot be undone.</p>
+                    <div class="form-actions">
+                        <button id="cancel-delete-btn" class="btn secondary-btn">Cancel</button>
+                        <button id="confirm-delete-btn" class="btn danger-btn">Delete</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="js/main.js"></script>
+</body>
+</html>
+
+
+// styles.css
+
+:root {
+    --primary-color: #4a6ff3;
+    --primary-dark: #3a5fd3;
+    --secondary-color: #6c757d;
+    --danger-color: #dc3545;
+    --success-color: #28a745;
+    --warning-color: #ffc107;
+    --light-gray: #f8f9fa;
+    --medium-gray: #e9ecef;
+    --dark-gray: #495057;
+    --border-color: #dee2e6;
+    --shadow-color: rgba(0, 0, 0, 0.1);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Roboto', sans-serif;
+    background-color: #f5f7fb;
+    color: #333;
+    line-height: 1.6;
+}
+
+.container {
+    min-height: 100vh;
+    position: relative;
+}
+
+/* Auth Styles */
+#auth-container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+}
+
+.auth-box {
+    background-color: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px var(--shadow-color);
+    width: 100%;
+    max-width: 480px;
+    overflow: hidden;
+}
+
+.tabs {
+    display: flex;
+    background-color: var(--light-gray);
+}
+
+.tab {
+    flex: 1;
+    text-align: center;
+    padding: 16px;
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--secondary-color);
+    transition: all 0.3s ease;
+}
+
+.tab.active {
+    background-color: white;
+    color: var(--primary-color);
+    border-bottom: 2px solid var(--primary-color);
+}
+
+.tab-content {
+    padding: 24px;
+}
+
+.tab-content form {
+    display: none;
+}
+
+.tab-content form.active {
+    display: block;
+}
+
+h2 {
+    margin-bottom: 24px;
+    text-align: center;
+    color: var(--dark-gray);
+}
+
+.input-group {
+    margin-bottom: 20px;
+}
+
+label {
+    display: block;
+    margin-bottom: 6px;
+    font-weight: 500;
+    color: var(--dark-gray);
+}
+
+input, textarea, select {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 16px;
+    transition: border 0.3s ease;
+}
+
+input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+.btn {
+    display: inline-block;
+    padding: 12px 24px;
+    border: none;
+    border-radius: 4px;
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    text-align: center;
+}
+
+.primary-btn {
+    background-color: var(--primary-color);
+    color: white;
+}
+
+.primary-btn:hover {
+    background-color: var(--primary-dark);
+}
+
+.secondary-btn {
+    background-color: var(--secondary-color);
+    color: white;
+}
+
+.danger-btn {
+    background-color: var(--danger-color);
+    color: white;
+}
+
+.form-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.error-message {
+    color: var(--danger-color);
+    font-size: 14px;
+    margin-top: 16px;
+    text-align: center;
+}
+
+/* Main App Styles */
+.hidden {
+    display: none !important;
+}
+
+header {
+    background-color: white;
+    box-shadow: 0 2px 4px var(--shadow-color);
+    padding: 16px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+}
+
+.logo i {
+    font-size: 24px;
+    color: var(--primary-color);
+    margin-right: 12px;
+}
+
+.logo h1 {
+    font-size: 24px;
+    font-weight: 500;
+    color: var(--dark-gray);
+}
+
+.user-info {
+    display: flex;
+    align-items: center;
+}
+
+#username-display {
+    font-weight: 500;
+    margin-right: 16px;
+}
+
+main {
+    display: flex;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px;
+}
+
+.sidebar {
+    width: 250px;
+    background-color: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px var(--shadow-color);
+    padding: 20px;
+    margin-right: 24px;
+}
+
+.filters h3, .tags-container h3 {
+    font-size: 18px;
+    color: var(--dark-gray);
+    margin-bottom: 16px;
+}
+
+.filters ul, .tags-container ul {
+    list-style: none;
+}
+
+.filters li, .tags-container li {
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.filters li:hover, .tags-container li:hover {
+    background-color: var(--light-gray);
+}
+
+.filters li.active {
+    background-color: var(--primary-color);
+    color: white;
+}
+
+.tasks-container {
+    flex: 1;
+    background-color: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px var(--shadow-color);
+    padding: 24px;
+}
+
+.tasks-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+}
+
+.tasks-header h2 {
+    margin: 0;
+    text-align: left;
+}
+
+#new-task-btn i {
+    margin-right: 8px;
+}
+
+.tasks-list {
+    display: grid;
+    grid-gap: 16px;
+    margin-bottom: 24px;
+}
+
+.task-card {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    background-color: white;
+    transition: all 0.3s ease;
+    cursor: pointer;
+    position: relative;
+}
+
+.task-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 4px 8px var(--shadow-color);
+}
+
+.task-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 12px;
+}
+
+.task-title {
+    font-size: 18px;
+    font-weight: 500;
+    color: var(--dark-gray);
+}
+
+.task-priority {
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+}
+
+.priority-low {
+    background-color: #e2f7df;
+    color: var(--success-color);
+}
+
+.priority-medium {
+    background-color: #fff8e1;
+    color: var(--warning-color);
+}
+
+.priority-high {
+    background-color: #ffe5e5;
+    color: var(--danger-color);
+}
+
+.task-description {
+    color: var(--secondary-color);
+    margin-bottom: 16px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.task-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 14px;
+    color: var(--secondary-color);
+}
+
+.task-due-date {
+    display: flex;
+    align-items: center;
+}
+
+.task-due-date i {
+    margin-right: 4px;
+}
+
+.task-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.task-tag {
+    background-color: var(--light-gray);
+    color: var(--secondary-color);
+    padding: 4px 8px;
+    border-radius: 16px;
+    font-size: 12px;
+}
+
+.task-status {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 24px;
+    height: 24px;
+    border-radius: 0 8px 0 8px;
+}
+
+.status-pending {
+    background-color: var(--secondary-color);
+}
+
+.status-in_progress {
+    background-color: var(--primary-color);
+}
+
+.status-completed {
+    background-color: var(--success-color);
+}
+
+#empty-state {
+    text-align: center;
+    padding: 48px 0;
+    color: var(--secondary-color);
+}
+
+.empty-illustration {
+    font-size: 64px;
+    color: var(--medium-gray);
+    margin-bottom: 16px;
+}
+
+/* Modal Styles */
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background-color: white;
+    border-radius: 8px;
+    width: 100%;
+    max-width: 600px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.delete-confirm {
+    max-width: 400px;
+    padding: 24px;
+}
+
+.modal-header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.modal-header h2 {
+    margin: 0;
+    text-align: left;
+}
+
+.close-modal {
+    font-size: 24px;
+    font-weight: bold;
+    cursor: pointer;
+    color: var(--secondary-color);
+}
+
+#task-form {
+    padding: 24px;
+}
+
+.form-row {
+    display: flex;
+    gap: 16px;
+}
+
+.form-row .input-group {
+    flex: 1;
+}
+
+/* Responsive Styles */
+@media (max-width: 768px) {
+    main {
+        flex-direction: column;
+        padding: 16px;
+    }
+    
+    .sidebar {
+        width: 100%;
+        margin-right: 0;
+        margin-bottom: 16px;
+    }
+    
+    .form-row {
+        flex-direction: column;
+        gap: 0;
+    }
+    
+    .modal-content {
+        margin: 0 16px;
+    }
+}
+
+/* JavaScript Implementation */
+// main.js
+
+// API URL - replace with your actual backend URL when deploying
+const API_URL = 'http://localhost:3000/api';
+
+// DOM Elements
+const authContainer = document.getElementById('auth-container');
+const appContainer = document.getElementById('app-container');
+const loginForm = document.getElementById('login-form');
+const registerForm = document.getElementById('register-form');
+const tabs = document.querySelectorAll('.tab');
+const loginError = document.getElementById('login-error');
+const registerError = document.getElementById('register-error');
+const usernameDisplay = document.getElementById('username-display');
+const logoutBtn = document.getElementById('logout-btn');
+const tasksList = document.getElementById('tasks-list');
+const emptyState = document.getElementById('empty-state');
+const newTaskBtn = document.getElementById('new-task-btn');
+const taskModal = document.getElementById('task-modal');
+const taskForm = document.getElementById('task-form');
+const modalTitle = document.getElementById('modal-title');
+const taskIdInput = document.getElementById('task-id');
+const deleteTaskBtn = document.getElementById('delete-task-btn');
+const deleteModal = document.getElementById('delete-modal');
+const cancelDeleteBtn = document.getElementById('cancel-delete-btn');
+const confirmDeleteBtn = document.getElementById('confirm-delete-btn');
+const closeModalBtn = document.querySelector('.close-modal');
+const filterButtons = document.querySelectorAll('.filters li');
+const tagsList = document.getElementById('tags-list');
+
+// App State
+let currentUser = null;
+let tasks = [];
+let tags = [];
+let activeFilter = 'all';
+let activeTagFilter = null;
+
+// Auth tab switching
+tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+        const tabName = tab.getAttribute('data-tab');
+        
+        // Make this tab active
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        
+        // Show corresponding form
+        document.getElementById('login-form').classList.remove('active');
+        document.getElementById('register-form').classList.remove('active');
+        document.getElementById(`${tabName}-form`).classList.add('active');
+        
+        // Clear error messages
+        loginError.textContent = '';
+        registerError.textContent = '';
+    });
+});
+
+// Login Form Handler
+loginForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const email = document.getElementById('login-email').value;
+    const password = document.getElementById('login-password').value;
+    
+    try {
+        const response = await fetch(`${API_URL}/login`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ email, password })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+            loginError.textContent = data.error || 'Login failed';
+            return;
+        }
+        
+        // Save token and user info
+        localStorage.setItem('token', data.token);
+        localStorage.setItem('user', JSON.stringify(data.user));
+        
+        // Update current user and show app
+        currentUser = data.user;
+        showApp();
+        
+    } catch (error) {
+        console.error('Login error:', error);
+        loginError.textContent = 'An unexpected error occurred. Please try again.';
+    }
+});
+
+// Register Form Handler
+registerForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const username = document.getElementById('register-username').value;
+    const email = document.getElementById('register-email').value;
+    const password = document.getElementById('register-password').value;
+    const confirmPassword = document.getElementById('register-confirm-password').value;
+    
+    // Client-side validation
+    if (password !== confirmPassword) {
+        registerError.textContent = 'Passwords do not match';
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_URL}/register`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ username, email, password })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+            registerError.textContent = data.error || 'Registration failed';
+            return;
+        }
+        
+        // Switch to login tab
+        tabs[0].click();
+        loginError.textContent = '';
+        registerError.textContent = '';
+        
+        // Add success message
+        loginError.textContent = 'Registration successful! Please login.';
+        loginError.style.color = 'var(--success-color)';
+        
+        // Auto-fill email
+        document.getElementById('login-email').value = email;
+        
+    } catch (error) {
+        console.error('Registration error:', error);
+        registerError.textContent = 'An unexpected error occurred. Please try again.';
+    }
+});
+
+// Logout Handler
+logoutBtn.addEventListener('click', () => {
+    // Clear storage and state
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    currentUser = null;
+    
+    // Show auth container
+    authContainer.classList.remove('hidden');
+    appContainer.classList.add('hidden');
+    
+    // Reset forms
+    loginForm.reset();
+    registerForm.reset();
+    loginError.textContent = '';
+    registerError.textContent = '';
+    
+    // Switch to login tab
+    tabs[0].click();
+});
+
+// New Task Button Handler
+newTaskBtn.addEventListener('click', () => {
+    openTaskModal();
+});
+
+// Task Modal Close Handler
+closeModalBtn.addEventListener('click', () => {
+    closeTaskModal();
+});
+
+// Filter Buttons Handler
+filterButtons.forEach(button => {
+    button.addEventListener('click', () => {
+        // Update active filter
+        activeFilter = button.getAttribute('data-filter');
+        
+        // Update UI
+        filterButtons.forEach(btn => btn.classList.remove('active'));
+        button.classList.add('active');
+        
+        // Refresh tasks list
+        renderTasks();
+    });
+});
+
+// Task Form Submit Handler
+taskForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const taskId = taskIdInput.value;
+    const title = document.getElementById('task-title').value;
+    const description = document.getElementById('task-description').value;
+    const status = document.getElementById('task-status').value;
+    const priority = document.getElementById('task-priority').value;
+    const dueDate = document.getElementById('task-due-date').value;
+    const tagsInput = document.getElementById('task-tags').value;
+    
+    // Parse tags
+    const tags = tagsInput
+        .split(',')
+        .map(tag => tag.trim())
+        .filter(tag => tag.length > 0);
+    
+    const taskData = {
+        title,
+        description,
+        status,
+        priority,
+        due_date: dueDate,
+        tags
+    };
+    
+    try {
+        let response;
+        
+        if (taskId) {
+            // Update existing task
+            response = await fetch(`${API_URL}/tasks/${taskId}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${localStorage.getItem('token')}`
+                },
+                body: JSON.stringify(taskData)
+            });
+        } else {
+            // Create new task
+            response = await fetch(`${API_URL}/tasks`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${localStorage.getItem('token')}`
+                },
+                body: JSON.stringify(taskData)
+            });
+        }
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to save task');
+        }
+        
+        // Close modal and refresh tasks
+        closeTaskModal();
+        fetchTasks();
+        
+    } catch (error) {
+        console.error('Task save error:', error);
+        alert('Failed to save task. Please try again.');
+    }
+});
+
+// Delete Task Button Handler
+deleteTaskBtn.addEventListener('click', () => {
+    const taskId = taskIdInput.value;
+    if (taskId) {
+        taskModal.classList.add('hidden');
+        deleteModal.classList.remove('hidden');
+    }
+});
+
+// Cancel Delete Handler
+cancelDeleteBtn.addEventListener('click', () => {
+    deleteModal.classList.add('hidden');
+    taskModal.classList.remove('hidden');
+});
+
+// Confirm Delete Handler
+confirmDeleteBtn.addEventListener('click', async () => {
+    const taskId = taskIdInput.value;
+    
+    try {
+        const response = await fetch(`${API_URL}/tasks/${taskId}`, {
+            method: 'DELETE',
+            headers: {
+                'Authorization': `Bearer ${localStorage.getItem('token')}`
+            }
+        });
+        
+        if (!response.ok) {
+            const data = await response.json();
+            throw new Error(data.error || 'Failed to delete task');
+        }
+        
+        // Close modals and refresh tasks
+        deleteModal.classList.add('hidden');
+        closeTaskModal();
+        fetchTasks();
+        
+    } catch (error) {
+        console.error('Task delete error:', error);
+        alert('Failed to delete task. Please try again.');
+    }
+});
+
+// Show App
+function showApp() {
+    // Hide auth, show app
+    authContainer.classList.add('hidden');
+    appContainer.classList.remove('hidden');
+    
+    // Update username display
+    usernameDisplay.textContent = currentUser.username;
+    
+    // Load tasks
+    fetchTasks();
+}
+
+// Fetch Tasks from API
+async function fetchTasks() {
+    try {
+        const response = await fetch(`${API_URL}/tasks`, {
+            headers: {
+                'Authorization': `Bearer ${localStorage.getItem('token')}`
+            }
+        });
+        
+        if (!response.ok) {
+            throw new Error('Failed to fetch tasks');
+        }
+        
+        const data = await response.json();
+        tasks = data;
+        
+        // Extract unique tags
+        extractTags();
+        
+        // Render tasks
+        renderTasks();
+        
+    } catch (error) {
+        console.error('Fetch tasks error:', error);
+        if (error.message === 'Failed to fetch') {
+            alert('Network error. Please check your connection and try again.');
+        }
+    }
+}
+
+// Extract and render unique tags
+function extractTags() {
+    // Extract all tags
+    const allTags = [];
+    tasks.forEach(task => {
+        if (task.tags && task.tags.length > 0) {
+            allTags.push(...task.tags);
+        }
+    });
+    
+    // Get unique tags
+    tags = [...new Set(allTags)];
+    
+    // Render tags
+    renderTags();
+}
+
+// Render Tags in sidebar
+function renderTags() {
+    tagsList.innerHTML = '';
+    
+    tags.forEach(tag => {
+        const li = document.createElement('li');
+        li.textContent = tag;
+        li.addEventListener('click', () => {
+            if (activeTagFilter === tag) {
+                // Clicking active tag removes the filter
+                activeTagFilter = null;
+                li.classList.remove('active');
+            } else {
+                // Apply new tag filter
+                activeTagFilter = tag;
+                
+                // Update UI
+                document.querySelectorAll('#tags-list li').forEach(item => {
+                    item.classList.remove('active');
+                });
+                li.classList.add('active');
+            }
+            
+            // Refresh tasks list
+            renderTasks();
+        });
+        
+        // Add active class if this is the current filter
+        if (tag === activeTagFilter) {
+            li.classList.add('active');
+        }
+        
+        tagsList.appendChild(li);
+    });
+}
+
+// Render Tasks
+function renderTasks() {
+    tasksList.innerHTML = '';
+    
+    // Filter tasks
+    let filteredTasks = [...tasks];
+    
+    // Apply status filter
+    if (activeFilter !== 'all') {
+        filteredTasks = filteredTasks.filter(task => task.status === activeFilter);
+    }
+    
+    // Apply tag filter
+    if (activeTagFilter) {
+        filteredTasks = filteredTasks.filter(task => 
+            task.tags && task.tags.includes(activeTagFilter)
+        );
+    }
+    
+    // Show empty state if no tasks
+    if (filteredTasks.length === 0) {
+        tasksList.innerHTML = '';
+        emptyState.classList.remove('hidden');
+        return;
+    }
+    
+    // Hide empty state
+    emptyState.classList.add('hidden');
+    
+    // Sort tasks by due date (closest first)
+    filteredTasks.sort((a, b) => {
+        if (!a.due_date) return 1;
+        if (!b.due_date) return -1;
+        return new Date(a.due_date) - new Date(b.due_date);
+    });
+    
+    // Create task cards
+    filteredTasks.forEach(task => {
+        const taskCard = createTaskCard(task);
+        tasksList.appendChild(taskCard);
+    });
+}
+
+// Create Task Card
+function createTaskCard(task) {
+    const card = document.createElement('div');
+    card.className = 'task-card';
+    card.setAttribute('data-id', task.id);
+    
+    // Add status indicator
+    const statusIndicator = document.createElement('div');
+    statusIndicator.className = `task-status status-${task.status}`;
+    card.appendChild(statusIndicator);
+    
+    // Create card header
+    const header = document.createElement('div');
+    header.className = 'task-header';
+    
+    const title = document.createElement('h3');
+    title.className = 'task-title';
+    title.textContent = task.title;
+    
+    const priority = document.createElement('span');
+    priority.className = `task-priority priority-${task.priority}`;
+    priority.textContent = task.priority;
+    
+    header.appendChild(title);
+    header.appendChild(priority);
+    card.appendChild(header);
+    
+    // Task description
+    if (task.description) {
+        const description = document.createElement('p');
+        description.className = 'task-description';
+        description.textContent = task.description;
+        card.appendChild(description);
+    }
+    
+    // Task metadata
+    const meta = document.createElement('div');
+    meta.className = 'task-meta';
+    
+    // Due date
+    if (task.due_date) {
+        const dueDate = document.createElement('div');
+        dueDate.className = 'task-due-date';
+        
+        const icon = document.createElement('i');
+        icon.className = 'fas fa-calendar-alt';
+        
+        const date = document.createElement('span');
+        date.textContent = formatDate(task.due_date);
+        
+        dueDate.appendChild(icon);
+        dueDate.appendChild(date);
+        meta.appendChild(dueDate);
+    }
+    
+    // Status text
+    const statusText = document.createElement('div');
+    statusText.className = 'task-status-text';
+    statusText.textContent = task.status.replace('_', ' ');
+    meta.appendChild(statusText);
+    
+    card.appendChild(meta);
+    
+    // Task tags
+    if (task.tags && task.tags.length > 0) {
+        const tagsContainer = document.createElement('div');
+        tagsContainer.className = 'task-tags';
+        
+        task.tags.forEach(tag => {
+            const tagElement = document.createElement('span');
+            tagElement.className = 'task-tag';
+            tagElement.textContent = tag;
+            tagsContainer.appendChild(tagElement);
+        });
+        
+        card.appendChild(tagsContainer);
+    }
+    
+    // Add click handler
+    card.addEventListener('click', () => {
+        openTaskModal(task);
+    });
+    
+    return card;
+}
+
+// Format date for display
+function formatDate(dateString) {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-US', { 
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+}
+
+// Open Task Modal
+function openTaskModal(task = null) {
+    // Reset form
+    taskForm.reset();
+    taskIdInput.value = '';
+    deleteTaskBtn.classList.add('hidden');
+    
+    if (task) {
+        // Edit existing task
+        modalTitle.textContent = 'Edit Task';
+        taskIdInput.value = task.id;
+        document.getElementById('task-title').value = task.title;
+        document.getElementById('task-description').value = task.description || '';
+        document.getElementById('task-status').value = task.status;
+        document.getElementById('task-priority').value = task.priority;
+        
+        if (task.due_date) {
+            const dueDate = new Date(task.due_date);
+            const formattedDate = dueDate.toISOString().slice(0, 16);
+            document.getElementById('task-due-date').value = formattedDate;
+        }
+        
+        if (task.tags && task.tags.length > 0) {
+            document.getElementById('task-tags').value = task.tags.join(', ');
+        }
+        
+        // Show delete button
+        deleteTaskBtn.classList.remove('hidden');
+    } else {
+        // New task
+        modalTitle.textContent = 'New Task';
+        document.getElementById('task-status').value = 'pending';
+        document.getElementById('task-priority').value = 'medium';
+    }
+    
+    // Show modal
+    taskModal.classList.remove('hidden');
+}
+
+// Close Task Modal
+function closeTaskModal() {
+    taskModal.classList.add('hidden');
+    deleteModal.classList.add('hidden');
+}
+
+// Check if user is already logged in
+function checkAuth() {
+    const token = localStorage.getItem('token');
+    const user = localStorage.getItem('user');
+    
+    if (token && user) {
+        try {
+            currentUser = JSON.parse(user);
+            showApp();
+        } catch (error) {
+            console.error('Error parsing user data:', error);
+            localStorage.removeItem('token');
+            localStorage.removeItem('user');
+        }
+    }
+}
+
+// Initialize
+window.addEventListener('DOMContentLoaded', () => {
+    checkAuth();
+    
+    // Close modals when clicking outside
+    window.addEventListener('click', (e) => {
+        if (e.target === taskModal) {
+            closeTaskModal();
+        }
+        if (e.target === deleteModal) {
+            deleteModal.classList.add('hidden');
+        }
+    });
+});
+
+
+/*
